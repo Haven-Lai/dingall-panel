@@ -1,0 +1,17 @@
+# Render.com 部署蓝图（一键导入即可）
+# 说明：本服务是完整后端（代理 121.41.9.82:4380 的钉钉大V发言流 + 东方财富情绪数据），
+#       Vercel 因出网仅限 80/443 无法代理 4380 端口，故用 Render 跑完整 Python 服务。
+services:
+  - type: web
+    name: dingall-panel
+    runtime: python
+    plan: free
+    region: singapore        # 离数据源(中国)最近，延迟最低；如新加坡名额满可改 oregon
+    branch: main
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python app.py"
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        sync: false
+        value: "3.12"

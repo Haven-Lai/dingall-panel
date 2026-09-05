@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>大V发言整合看板</title>
+<style>
+  :root{
+    --bg:#f5f6f8; --card:#ffffff; --text:#1f2329; --muted:#8a93a0;
+    --border:#e8eaed; --bar:#d7dbe0;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+       background:var(--bg);color:var(--text);font-size:14px;}
+  header{position:sticky;top:54px;z-index:10;background:rgba(255,255,255,.92);backdrop-filter:blur(8px);
+         border-bottom:1px solid var(--border);padding:12px 18px;}
+  .title{font-size:17px;font-weight:700;display:flex;align-items:center;gap:10px;}
+  .title .dot{width:9px;height:9px;border-radius:50%;background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.18);}
+  .sub{color:var(--muted);font-size:12px;margin-top:4px;display:flex;flex-wrap:wrap;gap:14px;align-items:center;}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;}
+  .chip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;
+        border:1px solid var(--border);background:#fff;font-size:12px;cursor:pointer;user-select:none;
+        transition:.15s;}
+  .chip .c-dot{width:8px;height:8px;border-radius:50%;}
+  .chip.off{opacity:.4;text-decoration:line-through;}
+  .chip .cnt{color:var(--muted);font-variant-numeric:tabular-nums;}
+  .ctrls{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap;}
+  .ctrls input[type=text]{flex:1;min-width:180px;padding:7px 11px;border:1px solid var(--border);
+        border-radius:8px;font-size:13px;outline:none;}
+  .ctrls input[type=text]:focus{border-color:#3b82f6;}
+  .btn{padding:7px 13px;border:1px solid var(--border);background:#fff;border-radius:8px;cursor:pointer;font-size:13px;}
+  .btn.primary{background:#3b82f6;color:#fff;border-color:#3b82f6;}
+  main{padding:16px 18px 60px;max-width:980px;margin:0 auto;}
+  .post{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px 14px;
+        margin-bottom:12px;display:flex;gap:12px;position:relative;overflow:hidden;}
+  .post .stripe{position:absolute;left:0;top:0;bottom:0;width:4px;}
+  .post .body{flex:1;min-width:0;}
+  .meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-bottom:6px;}
+  .tag{color:#fff;padding:2px 8px;border-radius:6px;font-size:12px;font-weight:600;}
+  .spk{font-weight:700;color:#1f2329;}
+  .time{font-variant-numeric:tabular-nums;}
+  .txt{white-space:pre-wrap;line-height:1.6;word-break:break-word;}
+  .empty{text-align:center;color:var(--muted);padding:60px 0;}
+  .err{color:#ef4444;}
+  .countdown{font-variant-numeric:tabular-nums;font-weight:600;}
+  .post.new{box-shadow:0 0 0 2px #22c55e inset;}
+  .badge-new{display:inline-block;background:#22c55e;color:#fff;font-size:10px;
+             padding:1px 6px;border-radius:5px;margin-left:6px;vertical-align:middle;}
+  .imgs{margin-top:8px;display:flex;flex-wrap:wrap;gap:8px;}
+  .imgs img{max-width:220px;max-height:220px;border-radius:8px;border:1px solid var(--border);cursor:pointer;}
+  .chip.active{background:#eef2ff;border-color:#3b82f6;opacity:1;text-decoration:none;font-weight:600;}
+  .tag.clickable,.spk.clickable{cursor:pointer;}
+  .tag.clickable:hover,.spk.clickable:hover{filter:brightness(.92);text-decoration:underline;}
+  .focusbar{position:sticky;top:0;z-index:5;background:#eef2ff;border:1px solid #c7d2fe;
+            color:#1e3a8a;border-radius:10px;padding:8px 12px;margin-bottom:12px;
+            display:flex;align-items:center;gap:10px;font-size:13px;}
+  .focusbar .x{cursor:pointer;margin-left:auto;background:#3b82f6;color:#fff;border-radius:6px;
+              padding:3px 10px;font-size:12px;}
+  .topnav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:16px;
+         background:rgba(255,255,255,.95);backdrop-filter:blur(8px);border-bottom:1px solid var(--border);
+         padding:10px 18px;}
+  .topnav .brand{font-weight:700;font-size:15px;display:flex;align-items:center;gap:8px;}
+  .topnav .tabs{display:flex;gap:6px;margin-left:auto;}
+  .topnav .tab{padding:7px 15px;border:1px solid var(--border);background:#fff;color:var(--muted);
+         border-radius:8px;cursor:pointer;font-size:13px;transition:.15s;text-decoration:none;}
+  .topnav .tab:hover{color:var(--text);}
+  .topnav .tab.active{background:#1f2329;color:#fff;border-color:#1f2329;}
+  #view-sentiment{position:fixed;left:0;right:0;top:54px;bottom:0;}
+  #view-sentiment iframe{width:100%;height:100%;border:0;display:block;background:#0b0f19;}
+</style>
+</head>
+<body>
+<div class="topnav">
+  <div class="brand">📊 盘中作战看板</div>
+  <div class="tabs">
+    <button class="tab active" data-view="feed">大V发言</button>
+    <button class="tab" data-view="sentiment">情绪看板</button>
+    <a class="tab" href="/sentiment" target="_blank" rel="noopener">↗ 新窗口</a>
+  </div>
+</div>
+<section id="view-feed">
+<header>
+  <div class="title"><span class="dot" id="liveDot"></span>大V发言整合看板</div>
+  <div class="sub">
+    <span>更新于：<b id="updated">--</b></span>
+    <span>共 <b id="total">0</b> 条</span>
+    <span>下次刷新 <span class="countdown" id="cd">5</span>s</span>
+    <span id="statusLine"></span>
+  </div>
+  <div class="chips" id="chips"></div>
+  <div class="ctrls">
+    <select id="win" class="btn" title="时间范围">
+      <option value="1">最近 1 小时</option>
+      <option value="6">最近 6 小时</option>
+      <option value="24" selected>最近 24 小时</option>
+      <option value="0">全部</option>
+    </select>
+    <input type="text" id="search" placeholder="搜索发言内容 / 发言人…">
+    <button class="btn" id="pauseBtn">暂停</button>
+    <button class="btn primary" id="refreshBtn">立即刷新</button>
+  </div>
+</header>
+<main id="feed"></main>
+</section>
+<section id="view-sentiment" style="display:none">
+  <iframe src="/sentiment" title="超短情绪量化监控" allow="fullscreen"></iframe>
+</section>
+
+<script>
+const REFRESH_MS = 5000;
+const COLORS = {
+  "龙头舵主":"#e74c3c",
+  "十倍之路":"#e67e22",
+  "自定义":"#9b59b6",
+  "极致短线2":"#1abc9c",
+  "极致短线":"#3498db",
+  "金牌竞价":"#f39c12"
+};
+let paused = false;
+let focus = null;            // 点名字只看某个人：{kind:'source'|'speaker', value:'名字'}
+let cdTimer = null;
+let cdLeft = REFRESH_MS/1000;
+let lastData = null;
+let currentHours = 24;
+let prevMaxTs = null;        // 上一次拉取的最新时间戳，用于标记新发言
+
+const $ = id => document.getElementById(id);
+
+function esc(s){return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+
+function renderChips(sources){
+  // 窗口内各来源条数（从当前 posts 统计）
+  const cnt = {};
+  (lastData ? lastData.posts : []).forEach(p=>{ cnt[p.source]=(cnt[p.source]||0)+1; });
+  const box = $("chips");
+  box.innerHTML = "";
+  sources.forEach(s=>{
+    const c = COLORS[s.name] || "#888";
+    const active = (focus && focus.kind==="source" && focus.value===s.name) ? " active" : "";
+    const dot = s.ok ? c : "#ef4444";
+    const n = cnt[s.name] || 0;
+    const el = document.createElement("span");
+    el.className = "chip"+active;
+    el.title = "点击只看「"+s.name+"」一个人";
+    el.innerHTML = `<span class="c-dot" style="background:${dot}"></span>${esc(s.name)}`
+                 + `<span class="cnt">${s.ok? n : "×"}</span>`;
+    el.onclick = ()=>{
+      if(focus && focus.kind==="source" && focus.value===s.name){ focus = null; }
+      else { focus = {kind:"source", value:s.name}; }
+      renderChips(sources); renderPosts();
+    };
+    box.appendChild(el);
+  });
+}
+
+// 把字符串安全地放进 onclick 的单引号 JS 字符串里
+function jsArg(s){ return (s||"").replace(/\\/g,"\\\\").replace(/'/g,"\\'"); }
+
+function setFocus(kind, value){
+  focus = {kind, value};
+  if(lastData) renderChips(lastData.sources||[]);
+  renderPosts();
+}
+function clearFocus(){
+  focus = null;
+  if(lastData) renderChips(lastData.sources||[]);
+  renderPosts();
+}
+
+function renderPosts(){
+  const q = $("search").value.trim().toLowerCase();
+  const feed = $("feed");
+  if(!lastData){ feed.innerHTML = `<div class="empty">加载中…</div>`; return; }
+  let posts = lastData.posts;
+  if(focus){
+    if(focus.kind==="source") posts = posts.filter(p=>p.source===focus.value);
+    else posts = posts.filter(p=>(p.speaker||"")===focus.value);
+  }
+  const filtered = q
+    ? posts.filter(p=>(p.text+" "+(p.speaker||"")).toLowerCase().includes(q))
+    : posts;
+  // 顶部「只看某人」提示条
+  let bar = "";
+  if(focus){
+    const label = focus.kind==="source" ? ("选手「"+focus.value+"」") : ("发言人「"+focus.value+"」");
+    bar = `<div class="focusbar">🔍 正在只看：${esc(label)}（共 ${filtered.length} 条）`
+        + `<span class="x" onclick="clearFocus()">✕ 显示全部</span></div>`;
+  }
+  if(!filtered.length){
+    feed.innerHTML = bar + `<div class="empty">${q?"无匹配发言":"暂无发言数据"}</div>`;
+    return;
+  }
+  feed.innerHTML = bar + filtered.map(p=>{
+    const c = COLORS[p.source] || "#888";
+    const spk = p.speaker
+      ? `<span class="spk clickable" title="点击只看「${esc(p.speaker)}」一个人" `
+        + `onclick="setFocus('speaker','${jsArg(p.speaker)}')">${esc(p.speaker)}</span>`
+      : "";
+    const isNew = (prevMaxTs !== null && p.ts > prevMaxTs);
+    const badge = isNew ? `<span class="badge-new">新</span>` : "";
+    let imgs = "";
+    if(p.images && p.images.length){
+      imgs = `<div class="imgs">` + p.images.map(u=>`<img src="${esc(u)}" loading="lazy" onclick="window.open('${esc(u)}')">`).join("") + `</div>`;
+    }
+    return `<div class="post${isNew?" new":""}">
+      <div class="stripe" style="background:${c}"></div>
+      <div class="body">
+        <div class="meta">
+          <span class="tag clickable" style="background:${c}" title="点击只看「${esc(p.source)}」一个人" `
+        + `onclick="setFocus('source','${jsArg(p.source)}')">${esc(p.source)}</span>
+          ${spk}
+          <span class="time">${esc(p.time)}</span>${badge}
+        </div>
+        <div class="txt">${esc(p.text)}</div>
+        ${imgs}
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function tick(){
+  $("cd").textContent = cdLeft;
+  cdLeft--;
+  if(cdLeft < 0) cdLeft = REFRESH_MS/1000;
+}
+
+async function load(){
+  try{
+    const r = await fetch("/api/feed?hours=" + currentHours, {cache:"no-store"});
+    const d = await r.json();
+    lastData = d;
+    $("updated").textContent = d.updated || "--";
+    $("total").textContent = d.total || 0;
+    const bad = (d.sources||[]).filter(s=>!s.ok);
+    $("statusLine").innerHTML = bad.length
+      ? `<span class="err">${bad.length} 个来源异常</span>` : `<span style="color:#22c55e">全部来源正常</span>`;
+    $("liveDot").style.background = bad.length ? "#f59e0b" : "#22c55e";
+    renderChips(d.sources||[]);
+    renderPosts();
+    if(d.posts && d.posts.length){
+      prevMaxTs = d.posts[0].ts;   // 已按时间倒序，首条即最新
+    }
+  }catch(e){
+    $("liveDot").style.background = "#ef4444";
+    $("statusLine").innerHTML = `<span class="err">服务连接失败：${esc(String(e))}</span>`;
+  }
+}
+
+function loop(){
+  if(!paused) load();
+}
+
+function startTimers(){
+  clearInterval(cdTimer);
+  cdLeft = REFRESH_MS/1000;
+  cdTimer = setInterval(tick, 1000);
+  clearInterval(window._loop);
+  window._loop = setInterval(loop, REFRESH_MS);
+}
+
+$("refreshBtn").onclick = ()=>{ cdLeft = REFRESH_MS/1000; load(); };
+$("win").onchange = (e)=>{ currentHours = parseInt(e.target.value,10) || 0; prevMaxTs = null; load(); };
+$("pauseBtn").onclick = ()=>{
+  paused = !paused;
+  $("pauseBtn").textContent = paused ? "继续" : "暂停";
+  $("pauseBtn").classList.toggle("primary", paused);
+};
+$("search").addEventListener("input", renderPosts);
+
+document.querySelectorAll('button.tab').forEach(b=>{
+  b.onclick = ()=>{
+    const v = b.dataset.view;
+    document.querySelectorAll('button.tab').forEach(x=>x.classList.toggle('active', x===b));
+    document.getElementById('view-feed').style.display = (v==='feed') ? '' : 'none';
+    document.getElementById('view-sentiment').style.display = (v==='sentiment') ? 'block' : 'none';
+  };
+});
+
+load();
+startTimers();
+</script>
+</body>
+</html>

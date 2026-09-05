@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>超短情绪量化监控系统</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", Roboto, sans-serif;
+    background: #0b0f19; color: #f1f5f9; margin: 0; padding: 22px 18px 40px;
+  }
+  .container { max-width: 1180px; margin: 0 auto; }
+
+  .header { display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+  .title h1 { font-size: 19px; margin: 0 0 4px; letter-spacing: .5px; }
+  .title .sub { font-size: 12px; color: #64748b; }
+  .status-wrap { display: flex; align-items: baseline; gap: 12px; }
+  .status-tag { font-size: 34px; font-weight: 800; line-height: 1.1; }
+  .score-val { font-size: 18px; color: #94a3b8; }
+  .controls { display: flex; gap: 8px; }
+  .btn { background: #1e293b; color: #94a3b8; border: 1px solid #334155; padding: 8px 16px;
+         border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 13px; }
+  .btn:hover { border-color: #475569; color: #e2e8f0; }
+  .btn.active { background: #38bdf8; color: #0b0f19; border-color: #38bdf8; }
+
+  .index-bar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .idx { background: #131b2e; border: 1px solid #1e293b; border-radius: 8px; padding: 8px 14px; min-width: 128px; }
+  .idx .n { font-size: 12px; color: #64748b; }
+  .idx .v { font-size: 16px; font-weight: 700; margin-top: 2px; }
+  .up { color: #ef4444; } .down { color: #22c55e; } .flat { color: #94a3b8; }
+
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 12px; }
+  .grid.sub { grid-template-columns: repeat(4, 1fr); }
+  .card { background: #131b2e; border: 1px solid #1e293b; border-radius: 8px; padding: 14px; text-align: center; }
+  .card-label { font-size: 12px; color: #64748b; margin-bottom: 6px; }
+  .card-value { font-size: 24px; font-weight: 800; letter-spacing: .5px; }
+  .card-note { font-size: 11px; color: #475569; margin-top: 4px; }
+
+  .advice-box { margin: 0 0 12px; padding: 12px 14px; border-left: 4px solid #38bdf8;
+                background: #131b2e; border-radius: 6px; font-size: 13.5px; color: #cbd5e1; }
+  .advice-box b { color: #e2e8f0; }
+
+  #chart { height: 440px; background: #131b2e; border: 1px solid #1e293b; border-radius: 10px; padding: 10px; }
+  .footer-zones { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;
+                  margin: 10px 0 16px; font-size: 12px; color: #64748b; }
+
+  .panels { display: grid; grid-template-columns: 300px 1fr; gap: 12px; }
+  .panel { background: #131b2e; border: 1px solid #1e293b; border-radius: 8px; padding: 12px 14px; }
+  .panel h3 { font-size: 13px; margin: 0 0 10px; color: #94a3b8; font-weight: 700; }
+  .ladder-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12.5px; }
+  .ladder-row .lv { width: 48px; color: #94a3b8; }
+  .ladder-bar { height: 8px; background: #ef4444; border-radius: 4px; }
+  .ladder-row .ct { color: #cbd5e1; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th { text-align: left; color: #64748b; font-weight: 600; padding: 4px 6px; border-bottom: 1px solid #1e293b; }
+  td { padding: 5px 6px; border-bottom: 1px solid #172033; color: #cbd5e1; }
+  td.r { text-align: right; }
+  .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; background: #1e293b; color: #94a3b8; }
+  .tag.yz { background: #7f1d1d; color: #fecaca; }
+  .reason { color: #64748b; font-size: 11.5px; }
+
+  .foot { margin-top: 16px; font-size: 11.5px; color: #475569; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+  .boot { padding: 40px; text-align: center; color: #64748b; font-size: 14px; }
+
+  @media (max-width: 860px) {
+    .grid, .grid.sub { grid-template-columns: repeat(2, 1fr); }
+    .panels { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <div class="header">
+    <div class="title">
+      <h1>超短情绪量化监控系统</h1>
+      <div class="sub">涨停 / 跌停 / 炸板 / 连板梯队 / 昨日溢价 —— 实时量化大盘环境</div>
+    </div>
+    <div class="controls">
+      <button id="btn-line" class="btn active" onclick="switchView('line')">分时走势图</button>
+      <button id="btn-k" class="btn" onclick="switchView('k')">周期日K线</button>
+    </div>
+  </div>
+
+  <div id="boot" class="boot">正在初始化行情数据，首次加载约需 10~30 秒…</div>
+
+  <div id="main" style="display:none;">
+    <div class="status-wrap" style="margin-bottom:14px;">
+      <span id="status" class="status-tag">连线中…</span>
+      <span id="score" class="score-val">--</span>
+    </div>
+
+    <div class="index-bar" id="idx-bar"></div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="card-label">涨停家数（一字板）</div>
+        <div class="card-value up" id="zt">--</div>
+        <div class="card-note" id="zt-note">--</div>
+      </div>
+      <div class="card">
+        <div class="card-label">跌停家数（一字跌停）</div>
+        <div class="card-value down" id="dt">--</div>
+        <div class="card-note" id="dt-note">--</div>
+      </div>
+      <div class="card">
+        <div class="card-label">盘面炸板率</div>
+        <div class="card-value" id="zb">--</div>
+        <div class="card-note" id="zb-note">--</div>
+      </div>
+      <div class="card">
+        <div class="card-label">连板空间高度</div>
+        <div class="card-value up" id="height">--</div>
+        <div class="card-note" id="height-note">--</div>
+      </div>
+    </div>
+
+    <div class="grid sub">
+      <div class="card">
+        <div class="card-label">昨日涨停今日溢价</div>
+        <div class="card-value" id="prem">--</div>
+        <div class="card-note" id="prem-note">情绪温度计</div>
+      </div>
+      <div class="card">
+        <div class="card-label">连板晋级率</div>
+        <div class="card-value" id="promo">--</div>
+        <div class="card-note" id="promo-note">中枢 20%~30%</div>
+      </div>
+      <div class="card">
+        <div class="card-label">涨跌家数</div>
+        <div class="card-value" id="breadth">--</div>
+        <div class="card-note" id="breadth-note">--</div>
+      </div>
+      <div class="card">
+        <div class="card-label">两市成交额</div>
+        <div class="card-value" id="amt">--</div>
+        <div class="card-note">亿元</div>
+      </div>
+    </div>
+
+    <div class="advice-box" id="advice">正在拉取策略建议…</div>
+
+    <div id="chart"></div>
+
+    <div class="footer-zones">
+      <span style="color:#22c55e;">■ 0-25 情绪冰点区（恐慌释放，试错首板）</span>
+      <span style="color:#eab308;">■ 26-50 混沌分歧区（控仓防守，忌追高）</span>
+      <span style="color:#ef4444;">■ 51-80 主升回暖区（重仓做龙，接力连板）</span>
+      <span style="color:#b91c1c;">■ 81-100 极度亢奋区（防分化，去弱留强）</span>
+    </div>
+
+    <div class="panels">
+      <div class="panel">
+        <h3>连板梯队</h3>
+        <div id="ladder"></div>
+      </div>
+      <div class="panel">
+        <h3>涨停板前排（按连板高度 / 封单排序）</h3>
+        <div style="max-height:260px;overflow-y:auto;">
+          <table>
+            <thead><tr><th>代码</th><th>名称</th><th>高度</th><th>类型</th><th class="r">封单(亿)</th><th>涨停原因</th></tr></thead>
+            <tbody id="boards"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="foot">
+      <div id="src">数据源：东方财富全市场行情 · 同花顺涨停池 · 腾讯指数　|
+        综合分含跌停/炸板/溢价/晋级（仅实时）；核心分含涨停/连板/一字（可回溯，用于日线）</div>
+      <div id="sync">--</div>
+    </div>
+  </div>
+</div>
+
+<script src="/echarts.min.js"></script>
+<script>
+if (typeof echarts === 'undefined') {
+  document.write('<script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"><\/script>');
+}
+</script>
+<script>
+  var currentView = 'line';
+  var chart = null;
+  var lastData = null;
+
+  function initChart() {
+    if (!chart && typeof echarts !== 'undefined') {
+      chart = echarts.init(document.getElementById('chart'));
+    }
+  }
+
+  function switchView(view) {
+    currentView = view;
+    document.getElementById('btn-line').classList.toggle('active', view === 'line');
+    document.getElementById('btn-k').classList.toggle('active', view === 'k');
+    render(lastData);
+  }
+
+  function pctCls(v) { return v > 0 ? 'up' : (v < 0 ? 'down' : 'flat'); }
+  function pctTxt(v) { return (v > 0 ? '+' : '') + v.toFixed(2) + '%'; }
+
+  async function fetchAndUpdate() {
+    try {
+      const res = await fetch('/api/data?t=' + Date.now());
+      const data = await res.json();
+      if (!data.ready) {
+        document.getElementById('sync').textContent = '初始化中…' + (data.error ? '（' + data.error + '）' : '');
+        return;
+      }
+      lastData = data;
+      document.getElementById('boot').style.display = 'none';
+      document.getElementById('main').style.display = 'block';
+      initChart();
+      paint(data);
+      render(data);
+    } catch (e) {
+      document.getElementById('sync').textContent = '连接服务失败，请确认 server.py 正在运行';
+    }
+  }
+
+  function paint(d) {
+    const cur = d.current;
+
+    const st = document.getElementById('status');
+    st.textContent = cur.status;
+    st.style.color = cur.color;
+    document.getElementById('score').innerHTML =
+      '情绪综合分 ' + cur.score + ' / 100' +
+      '<span style="font-size:12px;color:#64748b;margin-left:10px;">核心分 ' +
+      cur.core + '（日线口径）</span>';
+    document.getElementById('advice').innerHTML =
+      '<b>交易提示：</b>' + cur.advice +
+      (cur.trading ? '' : ' <span style="color:#64748b;">（当前非交易时段，展示最近一次收盘数据）</span>');
+
+    // 指数
+    document.getElementById('idx-bar').innerHTML = (cur.indices || []).map(function (i) {
+      return '<div class="idx"><div class="n">' + i.name + '</div>' +
+             '<div class="v ' + pctCls(i.pct) + '">' + i.cur.toFixed(2) +
+             ' <span style="font-size:13px;">' + pctTxt(i.pct) + '</span></div></div>';
+    }).join('');
+
+    document.getElementById('zt').textContent = cur.limit_up;
+    document.getElementById('zt-note').textContent = '其中一字板 ' + cur.one_word_up + ' 只';
+
+    document.getElementById('dt').textContent = cur.limit_down;
+    document.getElementById('dt-note').textContent = '其中一字跌停 ' + cur.one_word_down + ' 只';
+
+    const zbEl = document.getElementById('zb');
+    zbEl.textContent = cur.broken_ratio + '%';
+    zbEl.className = 'card-value ' + (cur.broken_ratio > 35 ? 'down' : (cur.broken_ratio < 20 ? 'up' : ''));
+    document.getElementById('zb-note').textContent = '炸板 ' + cur.broken + ' 只 / 触板 ' + (cur.limit_up + cur.broken) + ' 只';
+
+    document.getElementById('height').textContent = cur.max_height + ' 板';
+    document.getElementById('height-note').textContent = '连板股 ' +
+      (cur.ladder || []).filter(function (x) { return x.h >= 2; })
+        .reduce(function (a, b) { return a + b.n; }, 0) + ' 只';
+
+    const pEl = document.getElementById('prem');
+    pEl.textContent = pctTxt(cur.premium);
+    pEl.className = 'card-value ' + pctCls(cur.premium);
+    document.getElementById('prem-note').textContent = cur.prev_day
+      ? cur.prev_day + ' 涨停股今日平均表现'
+      : '情绪温度计';
+
+    const prEl = document.getElementById('promo');
+    prEl.textContent = cur.promo_rate + '%';
+    prEl.className = 'card-value ' + (cur.promo_rate >= 40 ? 'up' : (cur.promo_rate <= 15 ? 'down' : ''));
+    document.getElementById('promo-note').textContent = '昨日涨停 ' + (cur.prev_zt_total || 0) + ' 只晋级';
+
+    document.getElementById('breadth').innerHTML =
+      '<span class="up">' + cur.up + '</span> / <span class="down">' + cur.down + '</span>';
+    document.getElementById('breadth-note').textContent =
+      '涨幅>5% ' + cur.up5 + ' 只 · 跌幅>5% ' + cur.down5 + ' 只';
+
+    document.getElementById('amt').textContent = cur.amount;
+
+    // 连板梯队
+    const ladder = (cur.ladder || []).filter(function (x) { return x.h >= 1; });
+    const maxN = Math.max.apply(null, ladder.map(function (x) { return x.n; }).concat([1]));
+    document.getElementById('ladder').innerHTML = ladder.length ? ladder.map(function (x) {
+      const name = x.h === 1 ? '首板' : x.h + ' 板';
+      return '<div class="ladder-row"><span class="lv">' + name + '</span>' +
+             '<span class="ladder-bar" style="width:' + Math.max(6, x.n / maxN * 140) + 'px;"></span>' +
+             '<span class="ct">' + x.n + ' 只</span></div>';
+    }).join('') : '<div style="color:#475569;font-size:12px;">暂无连板数据</div>';
+
+    // 涨停前排
+    document.getElementById('boards').innerHTML = (cur.boards || []).map(function (b) {
+      return '<tr><td>' + b.code + '</td><td>' + b.name + '</td>' +
+             '<td>' + (b.h === 1 ? '首板' : b.h + '板') + '</td>' +
+             '<td><span class="tag' + (b.type === '一字板' ? ' yz' : '') + '">' + (b.type || '-') + '</span></td>' +
+             '<td class="r">' + b.order + '</td>' +
+             '<td class="reason">' + (b.reason || '-') + '</td></tr>';
+    }).join('') || '<tr><td colspan="6" style="color:#475569;">暂无数据</td></tr>';
+
+    const stale = d.stale ? ' <span style="color:#eab308;">（数据延迟）</span>' : '';
+    document.getElementById('sync').innerHTML =
+      '<span class="dot" style="background:' + (d.stale ? '#eab308' : '#22c55e') + '"></span>' +
+      '最后同步 ' + d.server_time + stale;
+  }
+
+  function render(d) {
+    if (!chart || !d) return;
+    if (currentView === 'line') renderLine(d.intraday || []);
+    else renderK(d.kline || []);
+  }
+
+  // 固定交易时段时间轴，形如股票软件分时图：
+  // 上午 9:30-11:30，下午 13:00-15:00；午休处插入 2 个占位，制造可见空隙。
+  function buildTradeAxis() {
+    var a = [];
+    function push(h, m) { a.push(('0' + h).slice(-2) + ':' + ('0' + m).slice(-2)); }
+    for (var h = 9; h <= 11; h++) {           // 上午
+      var ms = (h === 9) ? 30 : 0, me = (h === 11) ? 30 : 59;
+      for (var m = ms; m <= me; m++) push(h, m);
+    }
+    for (var h = 13; h <= 15; h++) {          // 下午
+      var ms = 0, me = (h === 15) ? 0 : 59;
+      for (var m = ms; m <= me; m++) push(h, m);
+    }
+    return a; // 242 个真实交易分钟
+  }
+  var RAW_AXIS = buildTradeAxis();
+  // 在 11:30 之后插入午休占位，让午休在横轴上表现为可见空隙（更像股票软件）
+  var GAP1 = '__GAP1__', GAP2 = '__GAP2__';
+  var TRADE_AXIS = [];
+  RAW_AXIS.forEach(function (t, i) {
+    TRADE_AXIS.push(t);
+    if (i === 120) { TRADE_AXIS.push(GAP1, GAP2); } // 11:30 之后补 2 个占位
+  });
+  var TRADE_IDX = {};
+  RAW_AXIS.forEach(function (t, i) { TRADE_IDX[t] = (i <= 120) ? i : i + 2; }); // 下午整体右移 2
+
+  function renderLine(list) {
+    // 按 HH:MM 对齐到交易时轴；午休/非交易时段数据丢弃
+    var map = {};
+    (list || []).forEach(function (i) {
+      var k = i.time ? i.time.slice(0, 5) : '';
+      if (k in TRADE_IDX) {
+        var v = (i.core !== undefined && i.core !== null) ? i.core : i.score;
+        map[k] = v;
+      }
+    });
+    // 对齐到含午休空隙的显示轴；占位与未到点均为 null
+    var data = TRADE_AXIS.map(function (t) { return (t in map) ? map[t] : null; });
+    var hasData = data.some(function (x) { return x !== null; });
+    var sub = hasData ? '' : '（仅交易时段 9:30-15:00 记录，当前无分时数据）';
+
+    chart.setOption({
+      backgroundColor: 'transparent',
+      title: {
+        text: '今日情绪分时', subtext: sub, left: 10, top: 6,
+        textStyle: { fontSize: 13, color: '#94a3b8', fontWeight: 'normal' },
+        subtextStyle: { color: '#64748b', fontSize: 11 }
+      },
+      tooltip: {
+        trigger: 'axis',
+        formatter: function (params) {
+          var p = params[0];
+          return p.name + '<br/>情绪分: ' + (p.value == null ? '—' : p.value);
+        }
+      },
+      grid: { left: '3%', right: '3%', top: '16%', bottom: '8%', containLabel: true },
+      xAxis: {
+        type: 'category', boundaryGap: false, data: TRADE_AXIS,
+        axisLine: { lineStyle: { color: '#334155' } },
+        axisTick: { show: false },
+        axisLabel: {
+          color: '#64748b',
+          // 每 30 分钟一个刻度；午休占位不显示标签，形成可见空隙
+          interval: function (idx, val) {
+            if (val === GAP1 || val === GAP2) return false;
+            return val.endsWith(':00') || val.endsWith(':30');
+          }
+        }
+      },
+      yAxis: { type: 'value', min: 0, max: 100, splitLine: { lineStyle: { color: '#1e293b' } },
+               axisLabel: { color: '#64748b' } },
+      series: [{
+        type: 'line', smooth: true, showSymbol: false, connectNulls: false,
+        data: data,
+        lineStyle: { width: 3, color: '#38bdf8' },
+        areaStyle: {
+          color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+            { offset: 0, color: 'rgba(56,189,248,0.35)' },
+            { offset: 1, color: 'rgba(56,189,248,0.02)' }
+          ])
+        },
+        markLine: {
+          silent: true, symbol: 'none',
+          data: [
+            { yAxis: 25, lineStyle: { color: '#22c55e', type: 'dashed' }, label: { formatter: '冰点线 25', color: '#22c55e' } },
+            { yAxis: 50, lineStyle: { color: '#eab308', type: 'dashed' }, label: { formatter: '强弱分界 50', color: '#eab308' } },
+            { yAxis: 80, lineStyle: { color: '#ef4444', type: 'dashed' }, label: { formatter: '高潮预警 80', color: '#ef4444' } },
+            { xAxis: GAP1, lineStyle: { color: '#475569' }, label: { formatter: '午休', color: '#64748b' } }
+          ]
+        }
+      }]
+    }, true);
+  }
+
+  function renderK(klist) {
+    chart.setOption({
+      backgroundColor: 'transparent',
+      title: {
+        text: '情绪核心分日线 · 涨停/连板/一字口径（历史与今日同口径可比）',
+        left: 10, top: 6, textStyle: { fontSize: 13, color: '#94a3b8', fontWeight: 'normal' }
+      },
+      tooltip: {
+        trigger: 'axis',
+        formatter: function (params) {
+          const p = params[0];
+          const v = p.data;                       // 蜡烛数据 [open, close, low, high]
+          const i = v.length >= 5 ? 1 : 0;        // 若为 5 位则首位是日期
+          return p.name + '<br/>开盘分: ' + v[i] + '<br/>收盘分: ' + v[i + 1] +
+                 '<br/>最低分: ' + v[i + 2] + '<br/>最高分: ' + v[i + 3];
+        }
+      },
+      grid: { left: '3%', right: '3%', top: '14%', bottom: '6%', containLabel: true },
+      xAxis: { type: 'category', data: klist.map(function (i) { return i[0]; }),
+               axisLine: { lineStyle: { color: '#334155' } }, axisLabel: { color: '#64748b' } },
+      yAxis: { type: 'value', min: 0, max: 100, splitLine: { lineStyle: { color: '#1e293b' } },
+               axisLabel: { color: '#64748b' } },
+      series: [{
+        type: 'candlestick',
+        data: klist.map(function (i) { return [i[1], i[2], i[3], i[4]]; }),
+        itemStyle: {
+          color: '#ef4444', color0: '#22c55e',
+          borderColor: '#ef4444', borderColor0: '#22c55e'
+        },
+        markLine: {
+          silent: true, symbol: 'none',
+          data: [
+            { yAxis: 25, lineStyle: { color: '#22c55e', type: 'dashed' } },
+            { yAxis: 50, lineStyle: { color: '#eab308', type: 'dashed' } },
+            { yAxis: 80, lineStyle: { color: '#ef4444', type: 'dashed' } }
+          ]
+        }
+      }]
+    }, true);
+  }
+
+  setInterval(fetchAndUpdate, 3000);
+  fetchAndUpdate();
+  window.addEventListener('resize', function () { if (chart) chart.resize(); });
+</script>
+</body>
+</html>
