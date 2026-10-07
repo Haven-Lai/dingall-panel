@@ -80,6 +80,9 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/sentiment", "/sentiment.html"):
             return self._serve_file("sentiment.html")
 
+        if path in ("/lianban", "/lianban.html"):
+            return self._serve_file("lianban.html")
+
         if path == "/echarts.min.js":
             return self._serve_file("echarts.min.js")
 

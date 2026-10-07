@@ -65,8 +65,9 @@
          border-radius:8px;cursor:pointer;font-size:13px;transition:.15s;text-decoration:none;}
   .topnav .tab:hover{color:var(--text);}
   .topnav .tab.active{background:#1f2329;color:#fff;border-color:#1f2329;}
-  #view-sentiment{position:fixed;left:0;right:0;top:54px;bottom:0;}
-  #view-sentiment iframe{width:100%;height:100%;border:0;display:block;background:#0b0f19;}
+  #view-sentiment,#view-lianban{position:fixed;left:0;right:0;top:54px;bottom:0;}
+  #view-sentiment iframe,#view-lianban iframe{width:100%;height:100%;border:0;display:block;background:#0b0f19;}
+  #view-lianban iframe{background:#152030;}
 </style>
 </head>
 <body>
@@ -75,7 +76,8 @@
   <div class="tabs">
     <button class="tab active" data-view="feed">大V发言</button>
     <button class="tab" data-view="sentiment">情绪看板</button>
-    <a class="tab" href="/sentiment" target="_blank" rel="noopener">↗ 新窗口</a>
+    <button class="tab" data-view="lianban">连板复盘</button>
+    <a class="tab" id="newWin" href="/sentiment" target="_blank" rel="noopener">↗ 新窗口</a>
   </div>
 </div>
 <section id="view-feed">
@@ -104,6 +106,9 @@
 </section>
 <section id="view-sentiment" style="display:none">
   <iframe src="/sentiment" title="超短情绪量化监控" allow="fullscreen"></iframe>
+</section>
+<section id="view-lianban" style="display:none">
+  <iframe src="/lianban" title="连板复盘" allow="fullscreen"></iframe>
 </section>
 
 <script>
@@ -267,12 +272,21 @@ $("pauseBtn").onclick = ()=>{
 };
 $("search").addEventListener("input", renderPosts);
 
+const VIEWS = ['feed','sentiment','lianban'];
 document.querySelectorAll('button.tab').forEach(b=>{
   b.onclick = ()=>{
     const v = b.dataset.view;
     document.querySelectorAll('button.tab').forEach(x=>x.classList.toggle('active', x===b));
-    document.getElementById('view-feed').style.display = (v==='feed') ? '' : 'none';
-    document.getElementById('view-sentiment').style.display = (v==='sentiment') ? 'block' : 'none';
+    VIEWS.forEach(name=>{
+      const el = document.getElementById('view-'+name);
+      if(!el) return;
+      el.style.display = (v===name) ? (name==='feed' ? '' : 'block') : 'none';
+    });
+    const nw = document.getElementById('newWin');
+    if(nw){
+      if(v==='feed'){ nw.style.display='none'; }
+      else { nw.style.display=''; nw.href = '/' + v; }
+    }
   };
 });
 

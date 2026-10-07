@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>连板复盘</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { min-height:100%; }
+  body {
+    font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', monospace;
+    background:#152030;
+    color:#e2e8f0;
+  }
+  .app {
+    width:90%; margin:0 auto; min-height:100vh;
+    background:#1a2736;
+    display:flex; flex-direction:column;
+    box-shadow:0 0 40px rgba(0,0,0,.5);
+  }
+
+  /* 顶栏 */
+  .topbar {
+    background:linear-gradient(135deg,#ff6b6b,#e03434);
+    color:#fff; padding:14px 20px 12px;
+    display:flex; align-items:center;
+    border-bottom:1px solid #e03434;
+    position:relative;
+  }
+  .topbar .title {
+    font-size:19px; font-weight:600; letter-spacing:1px; color:#fff;
+    position:absolute; left:50%; transform:translateX(-50%);
+  }
+  .refresh-btn { margin-left:auto; }
+  .refresh-btn {
+    width:36px; height:36px; border:1px solid rgba(255,255,255,.3); background:rgba(255,255,255,.15);
+    border-radius:50%; cursor:pointer; color:#fff;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .refresh-btn:hover { background:rgba(255,255,255,.25); }
+  .refresh-btn svg { width:18px; height:18px; transition:transform .6s; }
+  .refresh-btn.spinning svg { transform:rotate(360deg); }
+
+  /* 统计条 */
+  .stats-bar {
+    background:#1e2d3e; padding:12px 20px;
+    display:flex; align-items:center; gap:16px;
+    border-bottom:1px solid #3a4f66;
+  }
+  .stat .lbl { font-size:12px; color:#64748b; }
+  .stat .num { font-size:22px; font-weight:700; line-height:1.1; font-family:'Consolas',monospace; }
+  .stat-diff {
+    font-size:10px; margin-top:2px; color:#64748b;
+    font-family:'Consolas',monospace; white-space:nowrap;
+  }
+  .stat-diff.up { color:#ff6b6b; }
+  .stat-diff.down { color:#4ade80; }
+  .stat-diff.flat { color:#64748b; }
+  .num.red { color:#ff6b6b; }
+  .num.green { color:#4ade80; }
+  .stats-divider { width:1px; height:28px; background:#3a4f66; }
+  .date-wrap { margin-left:auto; display:flex; align-items:center; gap:6px; }
+  .date-wrap input[type=date] {
+    border:1px solid #3a4f66; border-radius:6px; padding:5px 8px;
+    font-size:14px; color:#94a3b8; background:#1a2736; outline:none;
+    font-family:inherit;
+  }
+
+  /* 子tab */
+  .sub-tabs {
+    background:#1e2d3e; display:flex; border-bottom:1px solid #3a4f66;
+  }
+  .sub-tab {
+    flex:1; text-align:center; padding:12px 0;
+    font-size:16px; color:#64748b; font-weight:600;
+    border-bottom:3px solid transparent;
+  }
+  .sub-tab.active { color:#ff6b6b; border-bottom-color:#ff6b6b; }
+
+  /* 题材区 */
+  .sector-pager { background:#1a2736; padding:12px 0 4px; }
+  .sector-grid {
+    display:grid; grid-template-columns:repeat(auto-fill, minmax(200px,1fr));
+    gap:10px; padding:0 16px;
+  }
+  .sector-card {
+    background:#263547; border:1px solid #3a4f66;
+    border-radius:10px; padding:10px 14px;
+    cursor:pointer; position:relative; min-height:58px;
+    transition:all .15s;
+  }
+  .sector-card:hover { background:#3a4f66; }
+  .sector-card .sec-name { font-size:15px; font-weight:600; }
+  .sector-card .sec-amount { font-size:12px; margin-top:4px; opacity:.6; }
+  .sector-card.active {
+    background:linear-gradient(135deg,#ff6b6b,#e03434);
+    border-color:#ff6b6b; color:#fff !important;
+    box-shadow:0 2px 12px rgba(255,77,77,.3);
+  }
+  .sector-card.active .sec-amount { opacity:.9; }
+  .sector-card .sec-arrow {
+    position:absolute; right:8px; bottom:6px;
+    width:20px; height:20px; border-radius:50%;
+    background:rgba(255,255,255,.2); color:#fff;
+    display:none; align-items:center; justify-content:center;
+    font-size:14px;
+  }
+  .sector-card.active .sec-arrow { display:flex; }
+  .sector-card.expand-card {
+    background:#1e2d3e; border:1px dashed #3a4f66;
+    display:flex; align-items:center; justify-content:center;
+    color:#64748b; font-size:14px; min-height:58px;
+  }
+  .sector-card.expand-card:hover { background:#263547; color:#94a3b8; }
+
+  /* 梯队 */
+  .ladder { padding:8px 16px 40px; }
+  .ladder-row {
+    display:flex; background:#1e2d3e; border:1px solid #3a4f66;
+    border-radius:10px; margin-bottom:10px; overflow:hidden; min-height:90px;
+  }
+  .row-label {
+    width:56px; flex-shrink:0; background:#1a2736;
+    display:flex; align-items:center; justify-content:center;
+    font-size:15px; font-weight:700; color:#e2e8f0;
+    border-right:1px solid #3a4f66;
+    letter-spacing:0;
+  }
+  .row-cells {
+    flex:1; display:grid; grid-template-columns:repeat(auto-fill, minmax(150px,1fr));
+    gap:8px; padding:10px;
+  }
+  .stock-card {
+    background:#263547; border:1px solid #3a4f66;
+    border-radius:8px; padding:6px 6px 8px;
+    display:flex; flex-direction:column; min-height:80px;
+    position:relative; transition:all .15s;
+  }
+  .card-top {
+    display:flex; justify-content:space-between; align-items:flex-start;
+    font-size:11px; color:#64748b; min-height:14px;
+  }
+  .range-label { color:#64748b; }
+  .card-top-left { display:flex; align-items:center; gap:3px; min-width:0; }
+  .lhb-tag {
+    font-size:9px; background:#ff6b6b; color:#fff;
+    padding:0 3px; border-radius:3px; line-height:14px; flex-shrink:0;
+  }
+  .time-label { color:#64748b; font-size:11px; }
+  .stock-name {
+    font-size:14px; font-weight:600; color:#e2e8f0;
+    margin-top:2px; text-align:center; line-height:1.3;
+  }
+  .stock-sector {
+    font-size:11px; text-align:right; margin-top:auto;
+  }
+  .card-bottom {
+    display:flex; justify-content:space-between; align-items:center;
+    margin-top:auto; padding-top:3px; gap:4px; min-width:0;
+  }
+  .super-flow {
+    font-size:10px; font-family:'Consolas',monospace;
+    white-space:nowrap;
+  }
+
+  .state-msg {
+    text-align:center; color:#64748b; padding:60px 20px; font-size:14px;
+  }
+  .state-msg .big { font-size:36px; margin-bottom:10px; }
+
+  /* 联动通达信开关 */
+  .tdx-toggle {
+    display:flex; align-items:center; gap:6px; cursor:pointer;
+    font-size:13px; color:#94a3b8; user-select:none;
+    padding:4px 10px; border:1px solid #3a4f66; border-radius:16px;
+    background:#263547; white-space:nowrap;
+  }
+  .tdx-toggle input { display:none; }
+  .tdx-toggle .tdx-box {
+    width:14px; height:14px; border:1.5px solid #4a5f7a; border-radius:3px;
+    display:inline-block; position:relative; transition:all .15s;
+  }
+  .tdx-toggle input:checked + .tdx-box {
+    background:#ff6b6b; border-color:#ff6b6b;
+  }
+  .tdx-toggle input:checked + .tdx-box::after {
+    content:'✓'; color:#fff; font-size:11px; position:absolute;
+    left:1px; top:-2px; line-height:14px;
+  }
+  .tdx-toggle:has(input:checked) {
+    background:rgba(255,77,77,.15); border-color:#ff6b6b; color:#ff6b6b;
+  }
+  .ladder.clickable .stock-card { cursor:pointer; }
+  .ladder.clickable .stock-card:hover { background:#3a4f66; border-color:#ff6b6b; }
+
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="title">连板复盘</div>
+    <button class="refresh-btn" id="refreshBtn" title="刷新数据">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="23 4 23 10 17 10"></polyline>
+        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+      </svg>
+    </button>
+  </header>
+
+  <div class="stats-bar">
+    <div class="stat">
+      <div class="lbl">上涨</div>
+      <div class="num red" id="upCount" style="font-size:18px">--</div>
+      <div class="stat-diff" id="upDiff"></div>
+    </div>
+    <div class="stats-divider"></div>
+    <div class="stat">
+      <div class="lbl">下跌</div>
+      <div class="num green" id="downCount" style="font-size:18px">--</div>
+      <div class="stat-diff" id="downDiff"></div>
+    </div>
+    <div class="stats-divider"></div>
+    <div class="stat">
+      <div class="lbl">涨停</div>
+      <div class="num red" id="ztCount">--</div>
+      <div class="stat-diff" id="ztDiff"></div>
+    </div>
+    <div class="stats-divider"></div>
+    <div class="stat">
+      <div class="lbl">跌停</div>
+      <div class="num green" id="dtCount">--</div>
+      <div class="stat-diff" id="dtDiff"></div>
+    </div>
+    <div class="stats-divider"></div>
+    <div class="stat">
+      <div class="lbl">两市成交</div>
+      <div class="num" id="totalAmount" style="color:#e2e8f0">--</div>
+      <div class="stat-diff" id="amtDiff"></div>
+    </div>
+    <label class="tdx-toggle" title="勾选后点击个股卡片在通达信中打开">
+      <input type="checkbox" id="tdxLink">
+      <span class="tdx-box"></span>
+      <span>联动通达信</span>
+    </label>
+    <div class="date-wrap">
+      <input type="date" id="dateInput">
+    </div>
+  </div>
+
+  <div class="sub-tabs">
+    <div class="sub-tab active">市场动向 · 涨停天梯</div>
+  </div>
+
+  <div class="sector-pager">
+    <div class="sector-grid" id="sectorGrid"></div>
+  </div>
+
+  <div class="ladder" id="ladder">
+    <div class="state-msg"><div class="big">⏳</div>正在加载当日涨停数据…</div>
+  </div>
+</div>
+
+<script>
+const UT = '7eea3edcaed734bea9cbfc24409ed989';
+const COLLAPSED = 9;   // 默认显示 3 行 × 每行自适应 = 最多9个
+let allStocks = [];
+let sectors = [];
+let activeSector = '全部市场';
+let expanded = false;
+let lhbSet = new Set();  // 前一交易日龙虎榜个股代码
+let flowMap = {};        // code -> 超大单净流入(元)
+let tdxEnabled = false;
+let todayVals = { up:undefined, down:undefined, zt:undefined, dt:undefined, amt:undefined };
+let yesterday = { up:undefined, down:undefined, zt:undefined, dt:undefined, amt:undefined };
+
+function ymd(d){
+  return d.getFullYear() + '-' +
+    String(d.getMonth()+1).padStart(2,'0') + '-' +
+    String(d.getDate()).padStart(2,'0');
+}
+
+// 昨日成交额 + 涨跌家数（日K接口；多子域名重试，日期用 YYYYMMDD）
+async function klinePrev(secid, prevDate){
+  const ymdNum = prevDate.replace(/-/g, '');
+  const hosts = [
+    'push2his.eastmoney.com',
+    '48.push2his.eastmoney.com',
+    '82.push2his.eastmoney.com',
+    '23.push2his.eastmoney.com',
+    '41.push2his.eastmoney.com'
+  ];
+  for(let t=0; t<2; t++){
+    for(const host of hosts){
+      try{
+        const url = `https://${host}/api/qt/stock/kline/get?secid=${secid}&ut=fa5fd1943c7b386f172d6893dbfba10b&fields1=f1,f2,f3&fields2=f51,f57,f104,f105&klt=101&fqt=0&beg=${ymdNum}&end=${ymdNum}`;
+        const res = await jsonp(url);
+        const kl = (res && res.data && res.data.klines) || [];
+        if(kl.length) return kl[kl.length-1].split(',');
+      }catch(e){}
+    }
+    await new Promise(r=>setTimeout(r, 500));
+  }
+  return null;
+}
+
+// 昨日涨停/跌停总数 + 成交额 + 涨跌家数
+async function fetchYesterday(dateStr){
+  const d = new Date(dateStr + 'T00:00:00');
+  d.setDate(d.getDate() - 1);
+  const prev = ymd(d);
+
+  // 涨停/跌停池返回字段是 tc 不是 total，用 pool.length 兜底
+  const pZt = jsonp(ztUrl(prev)).then(r=>{
+    const dd = (r && r.data) || {};
+    return (typeof dd.total === 'number' ? dd.total : 0) || (dd.pool ? dd.pool.length : 0) || 0;
+  }).catch(()=>0);
+  const pDt = jsonp(dtUrl(prev)).then(r=>{
+    const dd = (r && r.data) || {};
+    return (typeof dd.total === 'number' ? dd.total : 0) || (dd.pool ? dd.pool.length : 0) || 0;
+  }).catch(()=>0);
+  const pSh = klinePrev('1.000001', prev);
+  const pSz = klinePrev('0.399001', prev);
+
+  const [zt, dt, sh, sz] = await Promise.all([pZt, pDt, pSh, pSz]);
+
+  yesterday.zt = zt;
+  yesterday.dt = dt;
+
+  // 昨日成交额 = 上证+深证 f57
+  if(sh && sh[1] !== '' && sz && sz[1] !== ''){
+    yesterday.amt = (+sh[1]||0) + (+sz[1]||0);
+  } else {
+    yesterday.amt = undefined;
+  }
+
+  // 昨日涨跌家数 = 上证+深证 f104/f105（接口不支持时为 undefined）
+  if(sh && sh[2] !== '' && sh[3] !== '' && sz && sz[2] !== '' && sz[3] !== ''){
+    yesterday.up = (+sh[2]||0) + (+sz[2]||0);
+    yesterday.down = (+sh[3]||0) + (+sz[3]||0);
+  } else {
+    yesterday.up = undefined;
+    yesterday.down = undefined;
+  }
+
+  renderDiffs();
+}
+
+function setDiff(id, cur, prev){
+  const el = document.getElementById(id);
+  if(!el) return;
+  if(cur === undefined || prev === undefined){
+    el.textContent = (cur !== undefined) ? '昨 --' : '';
+    el.className = 'stat-diff';
+    return;
+  }
+  const d = cur - prev;
+  el.textContent = '较昨 ' + (d>0?'+':'') + d;
+  el.className = 'stat-diff ' + (d>0?'up':(d<0?'down':'flat'));
+}
+
+function renderDiffs(){
+  setDiff('upDiff', todayVals.up, yesterday.up);
+  setDiff('downDiff', todayVals.down, yesterday.down);
+  setDiff('ztDiff', todayVals.zt, yesterday.zt);
+  setDiff('dtDiff', todayVals.dt, yesterday.dt);
+  const el = document.getElementById('amtDiff');
+  if(el){
+    const cur = todayVals.amt, prev = yesterday.amt;
+    if(cur === undefined || prev === undefined){
+      el.textContent = (cur !== undefined) ? '昨 --' : '';
+      el.className = 'stat-diff';
+    } else {
+      const d = cur - prev;
+      const abs = Math.abs(d);
+      const txt = abs >= 1e12 ? (abs/1e12).toFixed(2) + '万亿' : (abs/1e8).toFixed(0) + '亿';
+      el.textContent = '较昨 ' + (d>0?'+':'-') + txt;
+      el.className = 'stat-diff ' + (d>0?'up':(d<0?'down':'flat'));
+    }
+  }
+}
+
+// 通过隐藏iframe联动通达信（需在通达信内置浏览器中打开本页面）
+function linkToTdx(code){
+  if(!code) return;
+  const iframe = document.createElement('iframe');
+  iframe.style.display = 'none';
+  iframe.src = 'http://www.treeid/code_' + code;
+  document.body.appendChild(iframe);
+  setTimeout(()=>{ if(iframe.parentNode) iframe.parentNode.removeChild(iframe); }, 1000);
+}
+
+// 前一交易日龙虎榜个股代码集合
+async function fetchLhbCodes(dateStr){
+  try{
+    const d = new Date(dateStr + 'T00:00:00');
+    d.setDate(d.getDate() - 1);
+    const prev = d.getFullYear() + '-' +
+      String(d.getMonth()+1).padStart(2,'0') + '-' +
+      String(d.getDate()).padStart(2,'0');
+    const url = `https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_DAILYBILLBOARD_DETAILS&columns=SECURITY_CODE&filter=(TRADE_DATE='${prev}')&pageSize=500&pageNumber=1&sortColumns=SECURITY_CODE&sortTypes=1`;
+    const res = await jsonp(url, 'callback');
+    const list = (res && res.result && res.result.data) || [];
+    lhbSet = new Set(list.map(x=> x.SECURITY_CODE));
+  }catch(e){
+    lhbSet = new Set();
+  }
+}
+
+// 拉取全部涨停股的超大单净流入（f66）
+async function fetchSuperFlow(stocks){
+  flowMap = {};
+  const secids = [];
+  stocks.forEach(s=>{
+    const c = s.code;
+    if(c.startsWith('6')) secids.push('1.' + c);
+    else if(c.startsWith('0') || c.startsWith('3')) secids.push('0.' + c);
+    // 北交所暂不支持资金流
+  });
+  if(!secids.length) return;
+
+  const url = 'https://push2delay.eastmoney.com/api/qt/ulist.np/get?ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&invt=2&fields=f12,f66&secids=';
+  try{
+    // 每批100只，并发拉取
+    const batch = [];
+    for(let i=0;i<secids.length;i+=100){
+      batch.push(jsonp(url + secids.slice(i,i+100).join(',')));
+    }
+    const resArr = await Promise.all(batch);
+    resArr.forEach(res=>{
+      const diff = (res && res.data && res.data.diff) || [];
+      diff.forEach(d=>{
+        if(d.f12) flowMap[d.f12] = d.f66;
+      });
+    });
+  }catch(e){
+    flowMap = {};
+  }
+}
+
+// 格式化超大单净流入
+function fmtFlow(v){
+  if(v === undefined || v === null || isNaN(v)) return '';
+  const abs = Math.abs(v);
+  const sign = v > 0 ? '+' : (v < 0 ? '-' : '');
+  if(abs >= 1e8) return sign + (abs/1e8).toFixed(2) + '亿';
+  if(abs >= 1e4) return sign + (abs/1e4).toFixed(0) + '万';
+  return sign + abs;
+}
+
+// 两市涨跌家数与成交额（上证+深证，push2delay 节点 JSONP 稳定）
+async function fetchTotalAmount(){
+  try{
+    const url = 'https://push2delay.eastmoney.com/api/qt/ulist.np/get?ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&invt=2&fields=f6,f104,f105,f12,f14&secids=1.000001,0.399001';
+    const res = await jsonp(url);
+    const diff = (res && res.data && res.data.diff) || [];
+    let up = 0, down = 0, total = 0;
+    diff.forEach(d=>{
+      up += (d.f104 || 0);
+      down += (d.f105 || 0);
+      total += (d.f6 || 0);
+    });
+    if(up) document.getElementById('upCount').textContent = up;
+    if(down) document.getElementById('downCount').textContent = down;
+    if(total > 0){
+      const yi = total / 1e8;
+      document.getElementById('totalAmount').textContent =
+        yi >= 10000 ? (yi/10000).toFixed(2) + '万亿' : yi.toFixed(0) + '亿';
+    }
+    todayVals.up = up || undefined;
+    todayVals.down = down || undefined;
+    todayVals.amt = total || undefined;
+    renderDiffs();
+  }catch(e){
+    document.getElementById('totalAmount').textContent = '--';
+    todayVals.amt = undefined;
+    renderDiffs();
+  }
+}
+
+// ---------- JSONP ----------
+let cbSeq = 0;
+function jsonp(url, cbParam){
+  cbParam = cbParam || 'cb';
+  return new Promise((resolve, reject)=>{
+    const cb = '__zt_cb_' + (++cbSeq);
+    const script = document.createElement('script');
+    const timer = setTimeout(()=>{ cleanup(); reject(new Error('请求超时')); }, 15000);
+    window[cb] = (data)=>{ clearTimeout(timer); cleanup(); resolve(data); };
+    script.onerror = ()=>{ clearTimeout(timer); cleanup(); reject(new Error('网络错误')); };
+    function cleanup(){ delete window[cb]; script.remove(); }
+    script.src = url + (url.includes('?')?'&':'?') + cbParam + '=' + cb + '&_=' + Date.now();
+    document.body.appendChild(script);
+  });
+}
+function ztUrl(d){ return `https://push2ex.eastmoney.com/getTopicZTPool?ut=${UT}&dpt=wz.ztzt&Pageindex=0&pagesize=500&sort=fbt:asc&date=${d.replace(/-/g,'')}`; }
+function dtUrl(d){ return `https://push2ex.eastmoney.com/getTopicDTPool?ut=${UT}&dpt=wz.ztzt&Pageindex=0&pagesize=500&sort=fund:asc&date=${d.replace(/-/g,'')}`; }
+
+// ---------- 工具 ----------
+function fmtTime(t){
+  if(!t) return '';
+  t = String(t).padStart(6,'0');
+  return (+t.slice(0,2)) + ':' + t.slice(2,4);
+}
+function fmtYi(yuan){
+  const yi = (yuan||0)/1e8;
+  if(yi >= 100) return yi.toFixed(0) + '亿';
+  return yi.toFixed(1).replace(/\.0$/,'') + '亿';
+}
+function sectorColor(count){
+  if(count >= 9) return '#ff6b6b';
+  if(count >= 7) return '#f59e0b';
+  return '#64748b';
+}
+function todayStr(){
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+
+// ---------- 加载 ----------
+async function loadData(dateStr){
+  const ladder = document.getElementById('ladder');
+  ladder.innerHTML = '<div class="state-msg"><div class="big">⏳</div>正在加载 ' + dateStr + ' 涨停数据…</div>';
+  document.getElementById('ztCount').textContent = '...';
+  document.getElementById('dtCount').textContent = '...';
+  expanded = false;
+  fetchTotalAmount();
+  fetchLhbCodes(dateStr);
+  fetchYesterday(dateStr);
+
+  try{
+    const [ztRes, dtRes] = await Promise.all([
+      jsonp(ztUrl(dateStr)),
+      jsonp(dtUrl(dateStr)).catch(()=>({data:{total:0, pool:[]}}))
+    ]);
+    const pool = (ztRes && ztRes.data && ztRes.data.pool) || [];
+    const total = (ztRes && ztRes.data && ztRes.data.total) || pool.length;
+    const dtPool = (dtRes && dtRes.data && dtRes.data.pool) || [];
+    const dtTotal = (dtRes && dtRes.data && dtRes.data.total) || dtPool.length;
+
+    document.getElementById('ztCount').textContent = total;
+    document.getElementById('dtCount').textContent = dtTotal;
+    todayVals.zt = total;
+    todayVals.dt = dtTotal;
+    renderDiffs();
+
+    if(!pool.length){
+      allStocks = []; sectors = [];
+      document.getElementById('sectorGrid').innerHTML = '';
+      ladder.innerHTML = '<div class="state-msg"><div class="big">📭</div>' + dateStr + ' 无涨停数据<br>（可能为非交易日或数据未更新）</div>';
+      return;
+    }
+
+    allStocks = pool.map(s=>{
+      const zttj = s.zttj || {};
+      // lbc = 当前连续连板数（断过板的只算当前连板）
+      const ct = s.lbc || zttj.ct || 1;
+      const days = zttj.days || 0;
+      // 区间涨停次数（zttj.ct）> 当前连板数时，标记 N天M板
+      const ztTimes = zttj.ct || ct;
+      const rangeLabel = (days && ztTimes > ct) ? (days + '天' + ztTimes + '板') : '';
+      const isYizi = (String(s.fbt) === '93000') && (s.zbc === 0);
+      return {
+        code:s.c, name:s.n, ct:ct,
+        timeText: isYizi ? '一字' : fmtTime(s.fbt),
+        rangeLabel: rangeLabel,
+        sector: s.hybk || '其他',
+        amount: s.amount||0,
+        fbt: s.fbt, zbc: s.zbc||0
+      };
+    });
+
+    const map = {};
+    allStocks.forEach(s=>{
+      if(!map[s.sector]) map[s.sector] = {name:s.sector, count:0, amount:0, stocks:[]};
+      map[s.sector].count++;
+      map[s.sector].amount += s.amount;
+      map[s.sector].stocks.push(s);
+    });
+    sectors = Object.values(map).sort((a,b)=> b.count-a.count || b.amount-a.amount);
+
+    activeSector = '全部市场';
+    fetchSuperFlow(allStocks).then(renderLadder);
+    renderSectors();
+    renderLadder();
+  }catch(err){
+    ladder.innerHTML = '<div class="state-msg"><div class="big">⚠️</div>数据加载失败：' + err.message + '<br>请点击右上角刷新重试</div>';
+  }
+}
+
+// ---------- 题材 ----------
+function renderSectors(){
+  const grid = document.getElementById('sectorGrid');
+  const totalAmount = allStocks.reduce((a,s)=>a+s.amount,0);
+  const items = [{name:'全部市场', count:allStocks.length, amount:totalAmount}].concat(sectors);
+
+  const shown = expanded ? items : items.slice(0, COLLAPSED);
+  const needToggle = items.length > COLLAPSED;
+
+  let html = '';
+  shown.forEach(it=>{
+    const isActive = it.name === activeSector;
+    const color = isActive ? '' : 'color:' + sectorColor(it.count);
+    html += `<div class="sector-card ${isActive?'active':''}" data-name="${it.name}" style="${color}">
+      <div class="sec-name">${it.name}(${it.count})</div>
+      <div class="sec-amount">成交额${fmtYi(it.amount)}</div>
+      <div class="sec-arrow">›</div>
+    </div>`;
+  });
+
+  if(needToggle){
+    html += `<div class="sector-card expand-card" id="toggleBtn">
+      ${expanded ? '收起 ▲' : '展开全部 ' + (items.length - COLLAPSED) + ' 个题材 ▼'}
+    </div>`;
+  }
+  grid.innerHTML = html;
+
+  grid.querySelectorAll('.sector-card[data-name]').forEach(card=>{
+    card.addEventListener('click', ()=>{
+      activeSector = card.dataset.name;
+      grid.querySelectorAll('.sector-card[data-name]').forEach(c=>{
+        const isAct = c.dataset.name === activeSector;
+        c.classList.toggle('active', isAct);
+        c.style.color = isAct ? '' : sectorColor(
+          parseInt((c.dataset.name.match(/\((\d+)\)/)||[])[1]||0)
+        );
+      });
+      renderLadder();
+    });
+  });
+  const tb = document.getElementById('toggleBtn');
+  if(tb) tb.addEventListener('click', ()=>{ expanded = !expanded; renderSectors(); });
+}
+
+// ---------- 梯队 ----------
+function renderLadder(){
+  const ladder = document.getElementById('ladder');
+  const stocks = activeSector === '全部市场'
+    ? allStocks
+    : allStocks.filter(s=> s.sector === activeSector);
+
+  if(!stocks.length){
+    ladder.innerHTML = '<div class="state-msg"><div class="big">📭</div>该题材当日无涨停股</div>';
+    return;
+  }
+
+  const groups = {};
+  stocks.forEach(s=>{ (groups[s.ct] = groups[s.ct]||[]).push(s); });
+  const cts = Object.keys(groups).map(Number).sort((a,b)=>b-a);
+  const maxCt = cts[0];
+
+  let html = '';
+  cts.forEach((ct, idx)=>{
+    const list = groups[ct].slice().sort((a,b)=> a.fbt - b.fbt);
+    let label;
+    if(ct === 1) label = '首板';
+    else label = ct + '板';
+
+    const cellsHtml = list.map(s=>{
+      const color = activeSector==='全部市场' ? sectorColor(countOfSector(s.sector)) : '#ff6b6b';
+      const lhbTag = lhbSet.has(s.code) ? '<span class="lhb-tag">榜</span>' : '';
+      const nameColor = s.ct >= 2 ? 'color:#ff6b6b' : '';
+      const flow = flowMap[s.code];
+      const flowText = (flow === undefined || flow === null) ? '' : '超大单' + fmtFlow(flow);
+      const flowColor = flow > 0 ? '#ff6b6b' : (flow < 0 ? '#4ade80' : '#64748b');
+      return `<div class="stock-card" data-code="${s.code}">
+        <div class="card-top">
+          <span class="card-top-left">${lhbTag}<span class="range-label">${s.rangeLabel||''}</span></span>
+          <span class="time-label">${s.timeText}</span>
+        </div>
+        <div class="stock-name" style="${nameColor}">${s.name}</div>
+        <div class="card-bottom">
+          <span class="super-flow" style="color:${flowColor}">${flowText}</span>
+          <span class="stock-sector" style="color:${color}">${s.sector}</span>
+        </div>
+      </div>`;
+    }).join('');
+
+    html += `<div class="ladder-row">
+      <div class="row-label">${label}</div>
+      <div class="row-cells">${cellsHtml}</div>
+    </div>`;
+  });
+  ladder.innerHTML = html;
+}
+function countOfSector(name){
+  const s = sectors.find(x=>x.name===name);
+  return s ? s.count : 0;
+}
+
+// ---------- 事件 ----------
+function doRefresh(){
+  const btn = document.getElementById('refreshBtn');
+  btn.classList.add('spinning');
+  setTimeout(()=> btn.classList.remove('spinning'), 700);
+  loadData(document.getElementById('dateInput').value);
+}
+document.getElementById('refreshBtn').addEventListener('click', doRefresh);
+document.getElementById('dateInput').addEventListener('change', (e)=>{
+  if(e.target.value) loadData(e.target.value);
+});
+
+// 联动通达信
+document.getElementById('tdxLink').addEventListener('change', (e)=>{
+  tdxEnabled = e.target.checked;
+  document.getElementById('ladder').classList.toggle('clickable', tdxEnabled);
+});
+document.getElementById('ladder').addEventListener('click', (e)=>{
+  if(!tdxEnabled) return;
+  const card = e.target.closest('.stock-card');
+  if(!card) return;
+  const code = card.dataset.code;
+  if(code) linkToTdx(code);
+});
+
+document.getElementById('dateInput').value = todayStr();
+loadData(todayStr());
+</script>
+</body>
+</html>
