@@ -44,6 +44,10 @@ INLINE_SPK_RE = re.compile(r'^\s*【\s*(.+?)\s*】\s*(.*)$')
 ROLE_RE = re.compile(r'^\s*([\u4e00-\u9fffA-Za-z0-9_]{1,8})\s*[:：]\s*$')
 # 内层时间戳：带 4 位年、月/日/时可能不带前导零（如 2026-8-21 12:14:46）
 INNER_TS_RE = re.compile(r'^\s*(\d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{2}:\d{2})\s*$')
+# 这些来源每条消息含两个时间戳：外层头（24 小时制，真实发帖时间）与
+# 内层（12 小时制，缺 AM/PM 标记，会比真实时间早 12 小时）。用户明确要求
+# 「按前面 24 小时制的时间来」，故这类来源一律采用外层（outer_time）。
+OUTER_TIME_SOURCES = {"金牌竞价", "龙头舵主"}
 # 仅剥离行首的【名字】前缀（不吞掉后续正文）
 STRIP_SPK_RE = re.compile(r'^\s*【\s*[^】]*\s*】\s*')
 # 纯发言人名（无标点、较短）
@@ -182,10 +186,15 @@ def parse_block(content, outer_time, source_name):
             body = re.sub(r'^\s*老师\s*[:：]?\s*', '', body)
         imgs = IMG_RE.findall(body)
         txt = clean_text(body)
-        # 钉钉时区残留：部分来源（龙头舵主、金牌竞价等）的内嵌时间戳比真实
-        # 发帖时间早约 12h，看着像旧数据且会被错序。当 inner_ts 明显早于外层
-        # 真实发帖时间（>6h）时，判定为残留，改用外层时间。
-        if outer_time and inner_ts and (outer_ts - inner_ts > 6 * 3600):
+        # 时间选取：
+        #  - OUTER_TIME_SOURCES（金牌竞价、龙头舵主等）：外层头是 24 小时制的真实发帖时间，
+        #    内层是 12 小时制（缺 AM/PM，早 12h），一律取外层（用户明确要求按前面 24h 时间）。
+        #  - 其他来源：内嵌时间戳若比外层早 >6h 也判定为残留，改用外层；
+        #    否则取内嵌时间（含发言人 MM-DD HH:MM:SS 的自定义类格式由 inner 提供）。
+        if source_name in OUTER_TIME_SOURCES and outer_time:
+            t = outer_time
+            ts = outer_ts
+        elif outer_time and inner_ts and (outer_ts - inner_ts > 6 * 3600):
             t = outer_time
             ts = outer_ts
         else:
