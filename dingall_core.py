@@ -182,9 +182,10 @@ def parse_block(content, outer_time, source_name):
             body = re.sub(r'^\s*老师\s*[:：]?\s*', '', body)
         imgs = IMG_RE.findall(body)
         txt = clean_text(body)
-        # 龙头舵主类：内嵌时间戳是钉钉时区残留（比真实发帖时间早约 12h），
-        # 用外层真实发帖时间，避免看着像旧数据
-        if source_name == "龙头舵主" and outer_time:
+        # 钉钉时区残留：部分来源（龙头舵主、金牌竞价等）的内嵌时间戳比真实
+        # 发帖时间早约 12h，看着像旧数据且会被错序。当 inner_ts 明显早于外层
+        # 真实发帖时间（>6h）时，判定为残留，改用外层时间。
+        if outer_time and inner_ts and (outer_ts - inner_ts > 6 * 3600):
             t = outer_time
             ts = outer_ts
         else:
