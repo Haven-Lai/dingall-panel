@@ -203,22 +203,194 @@ if (typeof echarts === 'undefined') {
   function pctCls(v) { return v > 0 ? 'up' : (v < 0 ? 'down' : 'flat'); }
   function pctTxt(v) { return (v > 0 ? '+' : '') + v.toFixed(2) + '%'; }
 
+  // ===== 前端直连东财/腾讯，绕开服务端出网限制（云端 Render 抓不到东财全市场） =====
+  const UT = '7eea3edcaed734bea9cbfc24409ed989';
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  function nowStr() {
+    const d = new Date();
+    const p = n => String(n).padStart(2, '0');
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+  function setSync(t) { const e = document.getElementById('sync'); if (e) e.textContent = t; }
+  function setBoot(t) {
+    const b = document.getElementById('boot');
+    if (b) { b.style.display = 'block'; b.textContent = t; }
+    const m = document.getElementById('main'); if (m) m.style.display = 'none';
+  }
+  function tradingNow() {
+    const d = new Date(); const w = d.getDay();
+    if (w === 0 || w === 6) return false;
+    const t = d.getHours() * 60 + d.getMinutes();
+    return t >= 555 && t <= 905; // 9:15 - 15:05
+  }
+
+  // JSONP helper（照连板复盘验证可用）
+  let cbSeq = 0;
+  function jsonp(url, cbParam) {
+    cbParam = cbParam || 'cb';
+    return new Promise(function (resolve, reject) {
+      const cb = '__em_cb_' + (++cbSeq);
+      const script = document.createElement('script');
+      const timer = setTimeout(function () { cleanup(); reject(new Error('请求超时')); }, 15000);
+      window[cb] = function (data) { clearTimeout(timer); cleanup(); resolve(data); };
+      script.onerror = function () { clearTimeout(timer); cleanup(); reject(new Error('网络错误')); };
+      function cleanup() { delete window[cb]; if (script.parentNode) script.remove(); }
+      script.src = url + (url.indexOf('?') >= 0 ? '&' : '?') + cbParam + '=' + cb + '&_=' + Date.now();
+      document.body.appendChild(script);
+    });
+  }
+  function ztUrl(d) { return 'https://push2ex.eastmoney.com/getTopicZTPool?ut=' + UT + '&dpt=wz.ztzt&Pageindex=0&pagesize=500&sort=fbt:asc&date=' + d.replace(/-/g, ''); }
+  function dtUrl(d) { return 'https://push2ex.eastmoney.com/getTopicDTPool?ut=' + UT + '&dpt=wz.ztzt&Pageindex=0&pagesize=500&sort=fund:asc&date=' + d.replace(/-/g, ''); }
+  function zbUrl(d) { return 'https://push2ex.eastmoney.com/getTopicZBPool?ut=' + UT + '&dpt=wz.ztzt&Pageindex=0&pagesize=500&sort=fbt:asc&date=' + d.replace(/-/g, ''); }
+  function breadthUrl() { return 'https://push2delay.eastmoney.com/api/qt/ulist.np/get?ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&invt=2&fields=f104,f105,f106,f6&secids=1.000001,0.399001,0.899001'; }
+
+  // 腾讯指数：全局变量注入式（非 cb），script 注入后读 window['v_'+code]；数字字段不受 GBK 影响
+  function fetchTencent() {
+    return new Promise(function (resolve) {
+      const codes = ['sh000001', 'sz399001', 'sz399006', 'sh000688'];
+      const names = { sh000001: '上证指数', sz399001: '深证成指', sz399006: '创业板指', sh000688: '科创50' };
+      const s = document.createElement('script');
+      let done = false;
+      s.onload = function () {
+        if (done) return; done = true;
+        const out = [];
+        codes.forEach(function (c) {
+          const raw = window['v_' + c];
+          if (!raw) return;
+          const f = raw.split('~');
+          if (f.length < 6) return;
+          const cur = parseFloat(f[3]), pre = parseFloat(f[4]);
+          const pct = pre ? ((cur - pre) / pre * 100) : 0;
+          out.push({ code: c, name: names[c], cur: cur, pct: pct });
+        });
+        resolve(out);
+      };
+      s.onerror = function () { resolve([]); };
+      s.src = 'https://qt.gtimg.cn/q=' + codes.join(',');
+      document.body.appendChild(s);
+      setTimeout(function () { if (!done) { done = true; resolve([]); } }, 8000);
+    });
+  }
+
+  // 情绪分（复刻后端 calc_score / calc_core_score / judge）
+  function calcCoreScore(zt, maxh, yz) {
+    let s = 50;
+    s += (Math.min(zt, 120) - 50) * 0.35;
+    s += (Math.min(maxh, 9) - 5) * 4;
+    s += (Math.min(yz, 12) - 4) * 1.2;
+    return clamp(s, 5, 95);
+  }
+  function calcScore(m, premium, promo) {
+    let sc = 50;
+    sc += (Math.min(m.limit_up, 120) - 50) * 0.35;
+    sc -= m.limit_down * 1.5;
+    sc -= m.one_word_down * 3;
+    sc += (Math.min(m.max_height, 9) - 5) * 4;
+    sc -= (m.broken_ratio - 30) * 0.6;
+    sc += (Math.min(m.one_word_up, 12) - 4) * 1.2;
+    sc += premium * 3;
+    sc += (promo - 25) * 0.5;
+    return clamp(sc, 5, 95);
+  }
+  function judge(score, br) {
+    const T = [[25, '情绪冰点', '#22c55e', '关注恐慌释放后的首板试错，回避高位补跌标的'],
+              [50, '混沌震荡', '#eab308', '资金轮动加速，控仓防守，切忌盘中追高打板'],
+              [80, '主升回暖', '#ef4444', '聚焦核心主线龙头，大胆做连板接力与强趋势中军'],
+              [100, '极度亢奋', '#b91c1c', '警惕次日严重分化，锁仓不追高，去弱留强']];
+    let st, col, adv;
+    for (let i = 0; i < T.length; i++) {
+      if (score <= T[i][0]) { st = T[i][1]; col = T[i][2]; adv = T[i][3]; break; }
+    }
+    if (35 <= score && score <= 60 && br > 35) {
+      st = '混沌震荡'; col = '#eab308'; adv = '题材分散、炸板率高企，控仓防守，切忌盘中追高打板';
+    }
+    return [st, col, adv];
+  }
+
+  async function fetchAll() {
+    const d = new Date();
+    const ymd = '' + d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+    const today = ymd.slice(0, 4) + '-' + ymd.slice(4, 6) + '-' + ymd.slice(6, 8);
+
+    const [zt, dt, zb, breadth] = await Promise.all([
+      jsonp(ztUrl(today)).catch(function () { return { data: { total: 0, pool: [] } }; }),
+      jsonp(dtUrl(today)).catch(function () { return { data: { total: 0, pool: [] } }; }),
+      jsonp(zbUrl(today)).catch(function () { return { data: { total: 0, pool: [] } }; }),
+      jsonp(breadthUrl()).catch(function () { return { data: { diff: [] } }; })
+    ]);
+
+    const ztPool = (zt.data && zt.data.pool) || [];
+    const dtPool = (dt.data && dt.data.pool) || [];
+    const zbPool = (zb.data && zb.data.pool) || [];
+    const ztTc = (zt.data && zt.data.total != null) ? zt.data.total : ztPool.length;
+    const dtTc = (dt.data && dt.data.total != null) ? dt.data.total : dtPool.length;
+    const zbTc = (zb.data && zb.data.total != null) ? zb.data.total : zbPool.length;
+
+    const oneWordUp = ztPool.filter(function (s) { return s.fbt === 92500 && s.zbc === 0; }).length;
+    const oneWordDown = dtPool.filter(function (s) { return s.fbt === 92500 && s.zbc === 0; }).length;
+    const maxHeight = ztPool.reduce(function (m, s) { return Math.max(m, (s.lbc || 1)); }, 1);
+
+    const g = {};
+    ztPool.forEach(function (s) { const c = s.lbc || 1; g[c] = (g[c] || 0) + 1; });
+    const ladder = Object.keys(g).map(Number).sort(function (a, b) { return b - a; })
+      .map(function (h) { return { h: h, n: g[h] }; });
+
+    const boards = ztPool.slice().sort(function (a, b) {
+      return (b.lbc - a.lbc) || ((b.fund || 0) - (a.fund || 0));
+    }).slice(0, 20).map(function (s) {
+      return {
+        code: s.c, name: s.n, h: s.lbc || 1,
+        type: (s.fbt === 92500 && s.zbc === 0) ? '一字板' : (s.zbc > 0 ? 'T板' : '换手板'),
+        order: ((s.fund || 0) / 1e8).toFixed(2),
+        reason: s.hybk || '-'
+      };
+    });
+
+    const zbSum = ztTc + zbTc;
+    const brokenRatio = zbSum > 0 ? +(zbTc / zbSum * 100).toFixed(1) : 0;
+
+    let up = 0, down = 0, flat = 0, amt = 0;
+    const diff = (breadth.data && breadth.data.diff) || [];
+    diff.forEach(function (x) { up += (x.f104 || 0); down += (x.f105 || 0); flat += (x.f106 || 0); amt += (x.f6 || 0); });
+
+    const indices = await fetchTencent();
+
+    const avgZdp = ztPool.length ? (ztPool.reduce(function (a, s) { return a + (s.zdp || 0); }, 0) / ztPool.length) : 0;
+    const promoRate = ztPool.length ? +((ztPool.filter(function (s) { return (s.lbc || 1) >= 2; }).length / ztPool.length) * 100).toFixed(1) : 0;
+
+    const m = { limit_up: ztTc, limit_down: dtTc, one_word_up: oneWordUp, one_word_down: oneWordDown, broken: zbTc, broken_ratio: brokenRatio, max_height: maxHeight };
+    const score = calcScore(m, avgZdp, promoRate);
+    const core = calcCoreScore(ztTc, maxHeight, oneWordUp);
+    const j = judge(score, brokenRatio);
+
+    return {
+      status: j[0], color: j[1], advice: j[2], score: score, core: core, indices: indices,
+      limit_up: ztTc, one_word_up: oneWordUp,
+      limit_down: dtTc, one_word_down: oneWordDown,
+      broken: zbTc, broken_ratio: brokenRatio,
+      max_height: maxHeight, ladder: ladder, boards: boards,
+      premium: +avgZdp.toFixed(2), prev_day: today, promo_rate: promoRate, prev_zt_total: ztTc,
+      up: up, down: down, flat: flat, up5: up, down5: down, amount: +(amt / 1e8).toFixed(1),
+      trading: tradingNow()
+    };
+  }
+
   async function fetchAndUpdate() {
+    setSync('正在拉取实时行情…');
     try {
-      const res = await fetch('/api/data?t=' + Date.now());
-      const data = await res.json();
-      if (!data.ready) {
-        document.getElementById('sync').textContent = '初始化中…' + (data.error ? '（' + data.error + '）' : '');
+      const cur = await fetchAll();
+      if (!cur || (cur.limit_up === 0 && cur.limit_down === 0 && cur.up === 0)) {
+        setBoot('暂无行情数据（可能为非交易时段，开盘后自动刷新）');
         return;
       }
-      lastData = data;
+      lastData = { current: cur, stale: false, server_time: nowStr(), intraday: [], kline: [] };
       document.getElementById('boot').style.display = 'none';
       document.getElementById('main').style.display = 'block';
       initChart();
-      paint(data);
-      render(data);
+      paint(lastData);
+      render(lastData);
     } catch (e) {
-      document.getElementById('sync').textContent = '连接服务失败，请确认 server.py 正在运行';
+      setBoot('加载失败：' + (e && e.message ? e.message : e) + '（请刷新重试）');
     }
   }
 
@@ -274,7 +446,7 @@ if (typeof echarts === 'undefined') {
     document.getElementById('breadth').innerHTML =
       '<span class="up">' + cur.up + '</span> / <span class="down">' + cur.down + '</span>';
     document.getElementById('breadth-note').textContent =
-      '涨幅>5% ' + cur.up5 + ' 只 · 跌幅>5% ' + cur.down5 + ' 只';
+      '上涨 ' + cur.up + ' · 下跌 ' + cur.down + ' · 平 ' + (cur.flat || 0) + '（沪深京）';
 
     document.getElementById('amt').textContent = cur.amount;
 
@@ -444,8 +616,12 @@ if (typeof echarts === 'undefined') {
     }, true);
   }
 
-  setInterval(fetchAndUpdate, 3000);
-  fetchAndUpdate();
+  function loop() {
+    fetchAndUpdate().finally(function () {
+      setTimeout(loop, tradingNow() ? 30000 : 120000);
+    });
+  }
+  loop();
   window.addEventListener('resize', function () { if (chart) chart.resize(); });
 </script>
 </body>
