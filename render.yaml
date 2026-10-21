@@ -8,6 +8,9 @@ services:
     plan: free
     region: singapore        # 离数据源(中国)最近，延迟最低；如新加坡名额满可改 oregon
     branch: main
+    # 提交即自动部署（On Commit）。取值：commit / checksPass / off
+    # 注意：autoDeploy 是已废弃的旧字段，现用 autoDeployTrigger，两者同时存在时后者优先
+    autoDeployTrigger: commit
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python app.py"
     healthCheckPath: /api/health
