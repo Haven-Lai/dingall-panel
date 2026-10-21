@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 大V发言整合服务
-- 代理 5 个 dingall 接口，解析发言（每个分组内含多位发言人的多条消息），合并成 JSON
+- 代理 7 个 dingall 接口，解析发言（每个分组内含多位发言人的多条消息），合并成 JSON
 - 提供 /api/feed（前端每 5 秒拉一次）与首页 /
 - 纯标准库，无需联网安装依赖
 """
@@ -14,6 +14,7 @@ import re
 import time
 import datetime
 import os
+import concurrent.futures
 
 # 忽略系统代理，直接连接上游（上游为公网 IP，无需代理；避免本机/他机代理设置干扰抓取）
 urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
@@ -21,7 +22,7 @@ urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHa
 HOST = "0.0.0.0"
 PORT = 8899
 
-# 6 个大V来源（直接使用原始接口地址）
+# 7 个大V来源（直接使用原始接口地址）
 SOURCES = [
     {"name": "龙头舵主", "url": "http://121.41.9.82:4380/dingall?a=%E9%BE%99%E5%A4%B4%E8%88%B5%E4%B8%BB%20&o=1&r=1"},
     {"name": "十倍之路", "url": "http://121.41.9.82:4380/dingall?a=%E5%8D%81%E5%80%8D%E4%B9%8B%E8%B7%AF%20&o=1&r=1"},
@@ -29,6 +30,7 @@ SOURCES = [
     {"name": "极致短线2", "url": "http://121.41.9.82:4380/dingall?a=%E6%9E%81%E8%87%B4%E7%9F%AD%E7%BA%BF2%20&o=1&r=1"},
     {"name": "极致短线",  "url": "http://121.41.9.82:4380/dingall?a=%E6%9E%81%E8%87%B4%E7%9F%AD%E7%BA%BF%20&o=1&r=1"},
     {"name": "金牌竞价",  "url": "http://121.41.9.82:4380/dingall?a=%E9%87%91%E7%89%8C%E7%AB%9E%E4%BB%B7%20&o=1&r=1"},
+    {"name": "灯神",      "url": "http://121.41.9.82:4380/dingall?a=%E7%81%AF%E7%A5%9E%20&o=1&r=1"},
 ]
 
 # 外层：一条记录的头（日期时间 + 分组名）
@@ -47,7 +49,7 @@ INNER_TS_RE = re.compile(r'^\s*(\d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{2}:\d{2})\s*$')
 # 这些来源每条消息含两个时间戳：外层头（24 小时制，真实发帖时间）与
 # 内层（12 小时制，缺 AM/PM 标记，会比真实时间早 12 小时）。用户明确要求
 # 「按前面 24 小时制的时间来」，故这类来源一律采用外层（outer_time）。
-OUTER_TIME_SOURCES = {"金牌竞价", "龙头舵主"}
+OUTER_TIME_SOURCES = {"金牌竞价", "龙头舵主", "灯神"}
 # 仅剥离行首的【名字】前缀（不吞掉后续正文）
 STRIP_SPK_RE = re.compile(r'^\s*【\s*[^】]*\s*】\s*')
 # 纯发言人名（无标点、较短）
@@ -180,6 +182,16 @@ def parse_block(content, outer_time, source_name):
                 body = "\n".join(bl)
 
         speaker = speaker.strip().strip("【】").strip()
+        # 群标签类（灯神）：内联标签里塞的是「群名 · MM-DD HH:MM · 发言人」或「群名 · 发言人」，
+        # 只取最后一个像人名的分段，避免整串（如「计划群 · 10-21 09:58 · 灯湖」）塞进发言人栏，
+        # 否则前端「点发言人只看他」会碎成一地。取不到人名（如「板块 20261019 · 2/2」）就留空。
+        if "·" in speaker:
+            spk_tail = ""
+            for part in reversed([x.strip() for x in speaker.split("·")]):
+                if NAME_RE.match(part) and not part.isdigit():
+                    spk_tail = part
+                    break
+            speaker = spk_tail
         # 龙头舵主：发言人恒为「老师」，且「老师:」/「老师 」常顶在正文开头，统一强制并剥离，避免正文短句被误当发言人
         if source_name == "龙头舵主":
             speaker = "老师"
@@ -272,8 +284,11 @@ def fetch_source(src):
 def build_feed(hours):
     all_posts = []
     sources_status = []
-    for src in SOURCES:
-        d = fetch_source(src)
+    # 各源并发抓取：串行时 7 个源合计 5~10 秒，前端 5 秒刷新会一直排队；
+    # 并发后总耗时约等于最慢的单个源（纯标准库 ThreadPoolExecutor，无额外依赖）。
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(SOURCES)) as ex:
+        results = list(ex.map(fetch_source, SOURCES))
+    for src, d in zip(SOURCES, results):
         sources_status.append({
             "name": src["name"], "ok": d["ok"], "count": d["count"],
             "error": d["error"], "fetched": d["fetched"],
