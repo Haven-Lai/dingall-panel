@@ -25,12 +25,12 @@ PORT = 8899
 # 7 个大V来源（直接使用原始接口地址）
 SOURCES = [
     {"name": "龙头舵主", "url": "http://121.41.9.82:4380/dingall?a=%E9%BE%99%E5%A4%B4%E8%88%B5%E4%B8%BB%20&o=1&r=1"},
-    {"name": "十倍之路", "url": "http://121.41.9.82:4380/dingall?a=%E5%8D%81%E5%80%8D%E4%B9%8B%E8%B7%AF%20&o=1&r=1"},
     {"name": "自定义",   "url": "http://121.41.9.82:4380/dingall?a=%E8%87%AA%E5%AE%9A%E4%B9%89%20&o=1&r=1"},
     {"name": "极致短线2", "url": "http://121.41.9.82:4380/dingall?a=%E6%9E%81%E8%87%B4%E7%9F%AD%E7%BA%BF2%20&o=1&r=1"},
     {"name": "极致短线",  "url": "http://121.41.9.82:4380/dingall?a=%E6%9E%81%E8%87%B4%E7%9F%AD%E7%BA%BF%20&o=1&r=1"},
     {"name": "金牌竞价",  "url": "http://121.41.9.82:4380/dingall?a=%E9%87%91%E7%89%8C%E7%AB%9E%E4%BB%B7%20&o=1&r=1"},
     {"name": "灯神",      "url": "http://121.41.9.82:4380/dingall?a=%E7%81%AF%E7%A5%9E%20&o=1&r=1"},
+    {"name": "金甲",      "url": "http://121.41.9.82:4380/dingall?a=%E9%87%91%E7%94%B2%20&o=1&r=1"},
 ]
 
 # 外层：一条记录的头（日期时间 + 分组名）
@@ -73,6 +73,7 @@ def clean_text(raw):
         return ""
     s = raw.replace("<br>", "\n").replace("<br/>", "\n").replace("<BR>", "\n")
     s = re.sub(r"!\[\]\(\s*", "", s)            # 去掉 markdown 图片语法 ![](
+    s = re.sub(r"\]\(\s*", "", s)               # 去掉 markdown 链接残留 ](（金甲纯图帖只发图，正文会剩这一截）
     s = re.sub(r"<[^>]+>", "", s)               # 去标签
     s = re.sub(r'https?://static\.dingtalk\.com/media/[^\s"\'<>]+', '', s)  # 去钉钉媒体裸链接（已单独作图片提取）
     s = s.replace("【", "").replace("】", "")
