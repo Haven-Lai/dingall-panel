@@ -60,6 +60,33 @@ IMG_RE = re.compile(r'https?://[^\s"\'<>]+\.(?:jpg|jpeg|png|gif)(?:\?[^\s"\'<>]*
 _cache = {}
 _CACHE_TTL = 4.0
 
+# 每日定时源：只在指定时间窗内高频刷新，窗外「当天已拉到过」就冻结、不再请求上游。
+# 金甲每天约 09:27 发一张图，9 点后当天不会再发——没必要整天每 5 秒拉它一次 190KB。
+# 窗口留到 09:40 是容错，防止某天略有延迟导致漏抓；冻结后看板仍显示已抓到的那条。
+DAILY_SOURCES = {
+    "金甲": {"window": ("09:00", "09:40")},
+}
+
+
+def _need_refresh(name, cached):
+    """每日定时源是否需要真正去请求上游。返回 False 表示直接复用缓存。"""
+    spec = DAILY_SOURCES.get(name)
+    if not spec:
+        return True
+    now = datetime.datetime.now()
+    hm = now.strftime("%H:%M")
+    lo, hi = spec["window"]
+    if lo <= hm <= hi:
+        # 发布窗口内：保持高频刷新，确保当天那张图一发出就被抓到
+        return True
+    if cached:
+        d = cached.get("data") or {}
+        # 窗外 + 当天已成功拉到过 -> 冻结，避免整天重复请求
+        if d.get("ok") and d.get("count") and cached.get("date") == now.strftime("%Y-%m-%d"):
+            return False
+    # 当天还没拉到过（如服务刚重启）仍需拉一次，否则看板会一整天没有金甲的图
+    return True
+
 
 def parse_ts(s):
     try:
@@ -257,6 +284,9 @@ def fetch_source(src):
     cached = _cache.get(src["url"])
     if cached and now - cached["t"] < _CACHE_TTL:
         return cached["data"]
+    # 每日定时源：在非发布时段且当天已拉到过，就不再打上游，直接复用上次结果
+    if not _need_refresh(src["name"], cached):
+        return cached["data"]
     best = None
     tried = 0
     for u in _candidate_urls(src):
@@ -278,7 +308,8 @@ def fetch_source(src):
     if tried > 1:
         best = dict(best)
         best["note"] = "已自动回退尝试 %d 个候选地址，采用返回最多的" % tried
-    _cache[src["url"]] = {"t": now, "data": best}
+    _cache[src["url"]] = {"t": now, "data": best,
+                          "date": datetime.datetime.now().strftime("%Y-%m-%d")}
     return best
 
 
