@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 大V发言整合服务
-- 代理 7 个 dingall 接口，解析发言（每个分组内含多位发言人的多条消息），合并成 JSON
+- 代理 6 个 dingall 接口，解析发言（每个分组内含多位发言人的多条消息），合并成 JSON
 - 提供 /api/feed（前端每 5 秒拉一次）与首页 /
 - 纯标准库，无需联网安装依赖
 """
@@ -22,14 +22,15 @@ urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHa
 HOST = "0.0.0.0"
 PORT = 8899
 
-# 7 个大V来源（直接使用原始接口地址）
+# 6 个大V来源（直接使用原始接口地址）
+# 顺序即前端色标 chip 的显示顺序（build_feed 按此顺序返回 sources）：
+# 灯神 / 金牌竞价 排在龙头舵主之前，是用户的阅读优先级要求。
 SOURCES = [
+    {"name": "灯神",      "url": "http://121.41.9.82:4380/dingall?a=%E7%81%AF%E7%A5%9E%20&o=1&r=1"},
+    {"name": "金牌竞价",  "url": "http://121.41.9.82:4380/dingall?a=%E9%87%91%E7%89%8C%E7%AB%9E%E4%BB%B7%20&o=1&r=1"},
     {"name": "龙头舵主", "url": "http://121.41.9.82:4380/dingall?a=%E9%BE%99%E5%A4%B4%E8%88%B5%E4%B8%BB%20&o=1&r=1"},
-    {"name": "自定义",   "url": "http://121.41.9.82:4380/dingall?a=%E8%87%AA%E5%AE%9A%E4%B9%89%20&o=1&r=1"},
     {"name": "极致短线2", "url": "http://121.41.9.82:4380/dingall?a=%E6%9E%81%E8%87%B4%E7%9F%AD%E7%BA%BF2%20&o=1&r=1"},
     {"name": "极致短线",  "url": "http://121.41.9.82:4380/dingall?a=%E6%9E%81%E8%87%B4%E7%9F%AD%E7%BA%BF%20&o=1&r=1"},
-    {"name": "金牌竞价",  "url": "http://121.41.9.82:4380/dingall?a=%E9%87%91%E7%89%8C%E7%AB%9E%E4%BB%B7%20&o=1&r=1"},
-    {"name": "灯神",      "url": "http://121.41.9.82:4380/dingall?a=%E7%81%AF%E7%A5%9E%20&o=1&r=1"},
     {"name": "金甲",      "url": "http://121.41.9.82:4380/dingall?a=%E9%87%91%E7%94%B2%20&o=1&r=1"},
 ]
 
