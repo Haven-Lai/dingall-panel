@@ -10,10 +10,12 @@ import http.server
 import socketserver
 import urllib.request
 import json
+import gzip
 import re
 import time
 import datetime
 import os
+import threading
 import concurrent.futures
 
 # 忽略系统代理，直接连接上游（上游为公网 IP，无需代理；避免本机/他机代理设置干扰抓取）
@@ -295,10 +297,10 @@ def _candidate_urls(src):
     return out
 
 
-def fetch_source(src):
+def fetch_source(src, force=False):
     now = time.time()
     cached = _cache.get(src["url"])
-    if cached and now - cached["t"] < _CACHE_TTL:
+    if not force and cached and now - cached["t"] < _CACHE_TTL:
         return cached["data"]
     # 每日定时源：在非发布时段且当天已拉到过，就不再打上游，直接复用上次结果
     if not _need_refresh(src["name"], cached):
@@ -329,22 +331,18 @@ def fetch_source(src):
     return best
 
 
-def build_feed(hours):
-    all_posts = []
+def _collect_all(force=False):
+    """并发抓所有源，合并去重排序，返回 (来源状态, 时间倒序的帖子)。"""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(SOURCES))) as ex:
+        results = list(ex.map(lambda s: fetch_source(s, force=force), SOURCES))
     sources_status = []
-    # 各源并发抓取：串行时 7 个源合计 5~10 秒，前端 5 秒刷新会一直排队；
-    # 并发后总耗时约等于最慢的单个源（纯标准库 ThreadPoolExecutor，无额外依赖）。
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(SOURCES)) as ex:
-        results = list(ex.map(fetch_source, SOURCES))
+    all_posts = []
     for src, d in zip(SOURCES, results):
         sources_status.append({
             "name": src["name"], "ok": d["ok"], "count": d["count"],
             "error": d["error"], "fetched": d["fetched"],
         })
         all_posts.extend(d["posts"])
-    if hours:
-        cutoff = time.time() - hours * 3600
-        all_posts = [p for p in all_posts if p["ts"] >= cutoff]
     # 去重（上游偶发重复同一条消息）
     seen = set()
     uniq = []
@@ -354,14 +352,130 @@ def build_feed(hours):
             continue
         seen.add(key)
         uniq.append(p)
-    all_posts = uniq
-    all_posts.sort(key=lambda p: p["ts"], reverse=True)
+    uniq.sort(key=lambda p: p["ts"], reverse=True)
+    return sources_status, uniq
+
+
+# ================= 内存快照：让前端请求不再陪上游一起等 =================
+# 旧实现里 /api/feed 每次都现抓 6 个源，上游最慢的那个拖多久、页面就等多久
+# （实测线上 8~50 秒）。改成后台线程持续刷新一份内存快照，
+# 前端请求只做「取快照 + 按 hours 过滤」，恒定为毫秒级。
+REFRESH_INTERVAL = 5.0     # 后台刷新节奏（秒），略大于前端 5 秒轮询
+
+# 快照落盘：进程重启（如 Render 休眠唤醒）后先拿上次的数据顶着，
+# 避免第一个访客对着白屏等一轮完整抓取；后台线程起来后会立刻用新数据覆盖。
+SNAPSHOT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "data", "feed_snapshot.json.gz")
+
+_snap_lock = threading.RLock()
+_refresh_lock = threading.Lock()
+_snap = {"t": 0.0, "posts": [], "sources": [], "updated": ""}
+
+
+def _load_snapshot_from_disk():
+    """读上次落盘的快照（只用于冷启动顶一下，失败就当没有）。"""
+    try:
+        with gzip.open(SNAPSHOT_FILE, "rt", encoding="utf-8") as f:
+            d = json.load(f)
+        posts = d.get("posts") or []
+        if not posts:
+            return None
+        print("[info] 已加载磁盘快照：%s（%d 条）" % (d.get("updated", "?"), len(posts)), flush=True)
+        return {"t": 0.0, "posts": posts, "sources": d.get("sources") or [],
+                "updated": d.get("updated") or "", "from_disk": True}
+    except Exception:
+        return None
+
+
+def _save_snapshot_to_disk(snap):
+    try:
+        os.makedirs(os.path.dirname(SNAPSHOT_FILE), exist_ok=True)
+        tmp = SNAPSHOT_FILE + ".tmp"
+        with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=1) as f:
+            json.dump({"updated": snap["updated"], "sources": snap["sources"],
+                       "posts": snap["posts"]}, f, ensure_ascii=False)
+        os.replace(tmp, SNAPSHOT_FILE)
+    except Exception:
+        pass
+
+
+def _refresh_snapshot():
+    """抓一轮写进快照。加锁串行，避免并发请求把上游打爆。"""
+    global _snap
+    with _refresh_lock:
+        if time.time() - _snap["t"] < 1.0:      # 刚被别人刷过，不重复抓
+            return _snap
+        sources_status, posts = _collect_all(force=True)
+        with _snap_lock:
+            _snap = {
+                "t": time.time(),
+                "posts": posts,
+                "sources": sources_status,
+                "updated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        _save_snapshot_to_disk(_snap)
+        return _snap
+
+
+def start_background_refresher():
+    """启动后台刷新线程（幂等）。app.py / server.py 启动时调用一次。"""
+    if getattr(start_background_refresher, "_started", False):
+        return
+    start_background_refresher._started = True
+
+    def loop():
+        while True:
+            t0 = time.time()
+            try:
+                _refresh_snapshot()
+            except Exception as e:
+                print("[warn] 快照刷新失败：%r" % (e,), flush=True)
+            # 上一轮结束后再等，上游慢的时候不会堆积任务
+            time.sleep(max(1.0, REFRESH_INTERVAL - (time.time() - t0)))
+
+    threading.Thread(target=loop, daemon=True, name="feed-refresher").start()
+
+
+_kick_lock = threading.Lock()
+_last_kick = 0.0
+
+
+def _kick_refresh():
+    """后台补刷一次（不阻塞调用方），带节流防止请求风暴把线程刷爆。"""
+    global _last_kick
+    now = time.time()
+    with _kick_lock:
+        if now - _last_kick < 10.0:
+            return
+        _last_kick = now
+    threading.Thread(target=_refresh_snapshot, daemon=True).start()
+
+
+def build_feed(hours):
+    snap = _snap
+    # 只有在「一条都没有」时才同步抓一次；有数据就先返回（哪怕旧一点），
+    # 顺手叫醒后台补刷，绝不让访客对着白屏等上游。
+    if not snap["posts"]:
+        snap = _refresh_snapshot()
+    elif time.time() - snap["t"] > REFRESH_INTERVAL * 4:
+        _kick_refresh()
+    posts = snap["posts"]
+    if hours:
+        cutoff = time.time() - hours * 3600
+        posts = [p for p in posts if p["ts"] >= cutoff]
     return {
-        "updated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "total": len(all_posts),
+        "updated": snap["updated"],
+        "total": len(posts),
         "hours": hours,
-        "sources": sources_status,
-        "posts": all_posts,
+        "sources": snap["sources"],
+        "posts": posts,
+        "snapshot_age": round(time.time() - snap["t"], 1),
     }
+
+
+# 模块加载时先顶一份上次落盘的数据（进程重启后首屏不用干等）
+_loaded = _load_snapshot_from_disk()
+if _loaded:
+    _snap = _loaded
 
 

@@ -13,17 +13,21 @@ import os
 import sys
 import json
 import time
+import gzip
 import threading
 import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-# 云容器默认 UTC，会把交易时段/日期算错（东八区）→ 统一按北京时间
-os.environ.setdefault("TZ", "Asia/Shanghai")
-try:
-    time.tzset()
-except Exception:
-    pass  # Windows 无 tzset，忽略（本地开发不受影响）
+# 云容器默认 UTC，会把交易时段/日期算错（东八区）→ 统一按北京时间。
+# 只在 Linux 上改：Windows 的 CRT 解析不了 "Asia/Shanghai" 这种 TZ 值，
+# 设了反而会把本地时间拨成 UTC（差 8 小时），本机调试时很坑。
+if os.name != "nt":
+    os.environ.setdefault("TZ", "Asia/Shanghai")
+    try:
+        time.tzset()
+    except Exception:
+        pass
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -51,8 +55,18 @@ class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         if isinstance(body, str):
             body = body.encode("utf-8")
+        zipped = False
+        # 文本类响应体积不小（/api/feed 约 87KB），gzip 后约 15KB，弱网下差别明显
+        if (len(body) >= 1024
+                and ctype.startswith(("application/json", "text/", "application/javascript"))
+                and "gzip" in (self.headers.get("Accept-Encoding") or "").lower()):
+            body = gzip.compress(body, 5)
+            zipped = True
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        if zipped:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -150,7 +164,10 @@ def worker():
 
 def main():
     port = int(os.environ.get("PORT", "10000"))
+    # 先把端口开起来，再让后台线程慢慢抓上游：
+    # /api/feed 只读内存快照，首次请求若快照还没建好才同步抓一次。
     threading.Thread(target=worker, daemon=True).start()
+    dingall_core.start_background_refresher()
     srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print("盘中作战看板已启动: 0.0.0.0:%d" % port, flush=True)
     try:
