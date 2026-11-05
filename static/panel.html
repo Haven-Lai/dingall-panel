@@ -245,10 +245,41 @@ async function load(){
     if(d.posts && d.posts.length){
       prevMaxTs = d.posts[0].ts;   // 已按时间倒序，首条即最新
     }
+    saveCache(d);
   }catch(e){
     $("liveDot").style.background = "#ef4444";
     $("statusLine").innerHTML = `<span class="err">服务连接失败：${esc(String(e))}</span>`;
   }
+}
+
+// 首屏先用上次的数据垫一下：跨境到 Render 光握手就要一两秒，
+// 有缓存的话打开瞬间就有内容，不用对着白屏等。数据到了自然覆盖。
+function cacheKey(){ return "feed_cache_" + currentHours; }
+
+function paintFromCache(){
+  try{
+    const c = JSON.parse(localStorage.getItem(cacheKey()) || "null");
+    if(!c || !c.posts || !c.posts.length) return false;
+    lastData = c;
+    $("updated").textContent = (c.updated || "--") + "（缓存）";
+    $("total").textContent = c.total || 0;
+    renderChips(c.sources||[]);
+    renderPosts();
+    return true;
+  }catch(e){ return false; }
+}
+
+let lastCacheSig = "";
+function saveCache(d){
+  // 内容没变就别反复序列化 90KB，省主线程时间
+  const sig = (d.posts&&d.posts.length ? d.posts[0].ts : 0) + "|" + (d.total||0) + "|" + currentHours;
+  if(sig === lastCacheSig) return;
+  lastCacheSig = sig;
+  try{
+    localStorage.setItem(cacheKey(), JSON.stringify({
+      updated: d.updated, total: d.total, sources: d.sources, posts: d.posts
+    }));
+  }catch(e){}
 }
 
 function loop(){
@@ -264,7 +295,7 @@ function startTimers(){
 }
 
 $("refreshBtn").onclick = ()=>{ cdLeft = REFRESH_MS/1000; load(); };
-$("win").onchange = (e)=>{ currentHours = parseInt(e.target.value,10) || 0; prevMaxTs = null; load(); };
+$("win").onchange = (e)=>{ currentHours = parseInt(e.target.value,10) || 0; prevMaxTs = null; paintFromCache(); load(); };
 $("pauseBtn").onclick = ()=>{
   paused = !paused;
   $("pauseBtn").textContent = paused ? "继续" : "暂停";
@@ -290,6 +321,7 @@ document.querySelectorAll('button.tab').forEach(b=>{
   };
 });
 
+paintFromCache();
 load();
 startTimers();
 </script>
