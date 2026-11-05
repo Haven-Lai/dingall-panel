@@ -75,6 +75,44 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    # 同时在线的最多 SSE 连接数：每个连接占一个线程，
+    # 别让人开十几个标签页把线程吃光（超了就退回轮询兜底）。
+    _sse_count = 0
+    _sse_lock = threading.Lock()
+
+    def _sse(self):
+        """SSE：源一变就推信号，前端收到立刻拉 /api/feed（比 5 秒轮询快得多）。"""
+        with Handler._sse_lock:
+            if Handler._sse_count >= 8:
+                return self._send(503, json.dumps({"error": "too many streams"},
+                                                  ensure_ascii=False))
+            Handler._sse_count += 1
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")   # 防反代缓冲把流憋住
+            self.end_headers()
+            self.close_connection = True
+            last = -1
+            deadline = time.time() + 600   # 10 分钟主动断开让浏览器重连，避免长连接泄漏
+            while time.time() < deadline:
+                ver = dingall_core.wait_version(last, timeout=20)
+                if ver != last:
+                    last = ver
+                    meta = dingall_core.snapshot_meta()
+                    self.wfile.write(("event: tick\ndata: %s\n\n"
+                                      % json.dumps(meta, ensure_ascii=False)).encode("utf-8"))
+                else:
+                    self.wfile.write(b": ping\n\n")   # 心跳，顺便探活
+                self.wfile.flush()
+        except Exception:
+            pass
+        finally:
+            with Handler._sse_lock:
+                Handler._sse_count -= 1
+
     def _serve_file(self, name):
         fp = os.path.join(STATIC_DIR, name)
         ext = os.path.splitext(name)[1].lower()
@@ -99,6 +137,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/echarts.min.js":
             return self._serve_file("echarts.min.js")
+
+        if path == "/api/stream":
+            return self._sse()
 
         if path == "/api/feed":
             try:
@@ -145,6 +186,7 @@ class Handler(BaseHTTPRequestHandler):
                     "last_ok": STATE["last_ok"],
                     "error": STATE["last_error"],
                     "refreshes": STATE["refresh_count"],
+                    "feed": dingall_core.poll_health(),
                 }, ensure_ascii=False))
 
         return self._send(404, json.dumps({"error": "not found"}, ensure_ascii=False))

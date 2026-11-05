@@ -355,21 +355,43 @@ def _collect_all(force=False):
     uniq.sort(key=lambda p: p["ts"], reverse=True)
     return sources_status, uniq
 
+# ================= 快照与「每源独立轮询」 =================
+# 上游 121.41.9.82:4380 每次请求都要现抓一遍钉钉（实测 0.7~1.1 秒、每源约 200KB），
+# 但它支持 Etag 条件请求：内容没变时回 304、0 字节。所以真正该压的不是「少抓」，
+# 而是「用 304 高频轻量地问」——实测 6 源 × 1.5 秒并发跑 76 秒零失败。
+#
+# 于是不再有「每 5 秒全量重抓一轮」这种东西：每个源一条独立轮询线程，各自条件请求；
+# 哪个源变了就立刻重建快照、版本号 +1，由 /api/stream（SSE）推给浏览器。
+# 内容感知延迟从「最长 5 秒（后台）+ 最长 5 秒（前端轮询）」压到 1.5 秒内。
+import urllib.error
 
-# ================= 内存快照：让前端请求不再陪上游一起等 =================
-# 旧实现里 /api/feed 每次都现抓 6 个源，上游最慢的那个拖多久、页面就等多久
-# （实测线上 8~50 秒）。改成后台线程持续刷新一份内存快照，
-# 前端请求只做「取快照 + 按 hours 过滤」，恒定为毫秒级。
-REFRESH_INTERVAL = 5.0     # 后台刷新节奏（秒），略大于前端 5 秒轮询
+SOURCE_POLL_INTERVAL = float(os.environ.get("DINGALL_POLL_SEC", "1.5"))
+FROZEN_POLL_INTERVAL = 30.0     # 每日定时源在冻结时段的轮询间隔
+DISK_SAVE_MIN_GAP = 20.0        # 快照落盘最小间隔（120KB，不必每轮都写）
+HTTP_TIMEOUT = 8
 
-# 快照落盘：进程重启（如 Render 休眠唤醒）后先拿上次的数据顶着，
-# 避免第一个访客对着白屏等一轮完整抓取；后台线程起来后会立刻用新数据覆盖。
 SNAPSHOT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "data", "feed_snapshot.json.gz")
 
-_snap_lock = threading.RLock()
-_refresh_lock = threading.Lock()
+_src_posts = {}       # 源名 -> 该源最新解析结果
+_src_status = {}      # 源名 -> {ok,count,error,fetched}
+_src_etag = {}        # 源名 -> 上次响应头里的 Etag
+_src_date = {}        # 源名 -> 上次成功抓取的日期（供每日定时源判断冻结）
+_src_lock = threading.RLock()
+_ver_lock = threading.Condition()
+_ver = 0
+_last_disk_save = 0.0
+_disk_dirty = False
+
 _snap = {"t": 0.0, "posts": [], "sources": [], "updated": ""}
+
+
+def _now_hm():
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+
+def _today():
+    return datetime.datetime.now().strftime("%Y-%m-%d")
 
 
 def _load_snapshot_from_disk():
@@ -380,6 +402,9 @@ def _load_snapshot_from_disk():
         posts = d.get("posts") or []
         if not posts:
             return None
+        # 按源拆开回填：某个源首轮请求失败时，它也不会从看板上凭空消失
+        for p in posts:
+            _src_posts.setdefault(p.get("source") or "", []).append(p)
         print("[info] 已加载磁盘快照：%s（%d 条）" % (d.get("updated", "?"), len(posts)), flush=True)
         return {"t": 0.0, "posts": posts, "sources": d.get("sources") or [],
                 "updated": d.get("updated") or "", "from_disk": True}
@@ -399,66 +424,201 @@ def _save_snapshot_to_disk(snap):
         pass
 
 
-def _refresh_snapshot():
-    """抓一轮写进快照。加锁串行，避免并发请求把上游打爆。"""
-    global _snap
-    with _refresh_lock:
-        if time.time() - _snap["t"] < 1.0:      # 刚被别人刷过，不重复抓
-            return _snap
-        sources_status, posts = _collect_all(force=True)
-        with _snap_lock:
-            _snap = {
-                "t": time.time(),
-                "posts": posts,
-                "sources": sources_status,
-                "updated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        _save_snapshot_to_disk(_snap)
-        return _snap
+def _is_frozen(name):
+    """每日定时源是否处于「当天已拿到、且不在发布窗口」的冻结状态。"""
+    pseudo = {"date": _src_date.get(name), "data": _src_status.get(name) or {}}
+    return not _need_refresh(name, pseudo)
+
+
+def _publish():
+    """把所有源的当前结果合并成一份快照，并叫醒所有 SSE 订阅者。"""
+    global _snap, _ver, _disk_dirty
+    all_posts = []
+    for src in SOURCES:
+        all_posts.extend(_src_posts.get(src["name"]) or [])
+    seen = set()
+    uniq = []
+    for p in all_posts:
+        key = (p["source"], p["speaker"], p["time"], p["text"])
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(p)
+    uniq.sort(key=lambda p: p["ts"], reverse=True)
+    status = []
+    for src in SOURCES:
+        m = _src_status.get(src["name"]) or {}
+        status.append({"name": src["name"], "ok": bool(m.get("ok")),
+                       "count": m.get("count", 0), "error": m.get("error") or "",
+                       "fetched": m.get("fetched") or ""})
+    snap = {"t": time.time(), "posts": uniq, "sources": status,
+            "updated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    with _ver_lock:
+        _snap = snap
+        _ver += 1
+        _ver_lock.notify_all()
+    # 只打脏标记，真正落盘交给 _disk_writer 低频去做：
+    # 若在这里按时间节流直接写，会出现「只写进第一个抓完的源、后面的完整数据写不进去」。
+    _disk_dirty = True
+    return _ver
+
+
+def _disk_writer():
+    """低频落盘线程：有变化才写，且保证最终会写下完整的一份。"""
+    global _disk_dirty
+    while True:
+        time.sleep(DISK_SAVE_MIN_GAP)
+        if _disk_dirty:
+            _disk_dirty = False
+            _save_snapshot_to_disk(_snap)
+
+
+def current_version():
+    return _ver
+
+
+def wait_version(last, timeout=20.0):
+    """SSE 用：等版本号变化；超时返回当前版本（上层据此发心跳）。"""
+    with _ver_lock:
+        if _ver == last:
+            _ver_lock.wait(timeout)
+        return _ver
+
+
+def snapshot_meta():
+    """SSE 只推这个轻量摘要，正文仍由前端自己去拉 gzip 后的 /api/feed。"""
+    with _ver_lock:
+        return {"ver": _ver, "total": len(_snap["posts"]), "updated": _snap["updated"]}
+
+
+def poll_health():
+    """每个源最近一次轮询的状态（排查「为啥不更新」时直接看这个）。"""
+    out = {}
+    with _src_lock:
+        for src in SOURCES:
+            n = src["name"]
+            m = _src_status.get(n) or {}
+            out[n] = {"ok": m.get("ok"), "fetched": m.get("fetched"),
+                      "count": m.get("count", 0), "etag": bool(_src_etag.get(n)),
+                      "interval": FROZEN_POLL_INTERVAL if _is_frozen(n) else SOURCE_POLL_INTERVAL}
+        return {"version": _ver, "posts": len(_snap["posts"]), "sources": out}
+
+
+def _poll_source_once(src):
+    """对单个源做一次条件请求。返回 True 表示状态或内容有变化，需要重建快照。"""
+    name = src["name"]
+    etag = _src_etag.get(name)
+    last_err = ""
+    for u in _candidate_urls(src):
+        headers = {"User-Agent": "Mozilla/5.0"}
+        if etag:
+            headers["If-None-Match"] = etag
+        try:
+            req = urllib.request.Request(u, headers=headers)
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                raw = resp.read()
+                new_etag = (resp.headers.get("Etag") or "").strip()
+        except urllib.error.HTTPError as e:
+            if e.code == 304:
+                # 绝大多数轮询都走这里：0 字节、不解析、不改快照
+                with _src_lock:
+                    cur = dict(_src_status.get(name) or {})
+                    cur.update({"ok": True, "error": "", "fetched": _now_hm()})
+                    _src_status[name] = cur
+                    if not _src_posts.get(name):
+                        # 内存里没数据却回 304，说明 etag 没意义了，下轮强制全量
+                        _src_etag.pop(name, None)
+                return False
+            last_err = "HTTP %s" % e.code
+            continue
+        except Exception as e:
+            last_err = str(e)[:120]
+            continue
+
+        # 200：内容确实变了，解析后替换该源
+        txt = raw.decode("utf-8", "ignore")
+        posts = parse_posts(txt, name)
+        with _src_lock:
+            old = _src_posts.get(name)
+            changed = True
+            if old and posts and len(old) == len(posts):
+                # 长度和最新一条都没变（上游忽略 If-None-Match 时会出现），不必惊动快照
+                changed = (old[0].get("time") != posts[0].get("time")
+                           or old[0].get("text") != posts[0].get("text")
+                           or (old[0].get("images") or []) != (posts[0].get("images") or []))
+            _src_posts[name] = posts
+            if new_etag:
+                _src_etag[name] = new_etag
+            _src_status[name] = {"ok": True, "count": len(posts), "error": "",
+                                 "fetched": _now_hm()}
+            _src_date[name] = _today()
+        return changed
+
+    # 所有候选地址都失败：保留已有数据，只把状态标红
+    with _src_lock:
+        prev_ok = (_src_status.get(name) or {}).get("ok")
+        _src_etag.pop(name, None)          # etag 可能已失效，下轮强制全量
+        cur = dict(_src_status.get(name) or {})
+        cur.update({"ok": False, "error": last_err, "fetched": _now_hm(),
+                    "count": len(_src_posts.get(name) or [])})
+        _src_status[name] = cur
+    # 已经在报错就别每 1.5 秒推一次「还是错的」，只在状态翻转时通知前端
+    return prev_ok is not False
+
+
+def _poll_all_once():
+    """并发抓一轮所有源（只在冷启动、快照为空时用）。"""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(SOURCES))) as ex:
+        list(ex.map(_poll_source_once, SOURCES))
+    return _publish()
+
+
+def _source_loop(src):
+    name = src["name"]
+    while True:
+        t0 = time.time()
+        interval = SOURCE_POLL_INTERVAL
+        changed = False
+        try:
+            if _is_frozen(name):
+                interval = FROZEN_POLL_INTERVAL
+            else:
+                changed = _poll_source_once(src)
+        except Exception as e:
+            print("[warn] %s 轮询异常：%r" % (name, e), flush=True)
+        if changed:
+            try:
+                _publish()
+            except Exception as e:
+                print("[warn] 快照重建失败：%r" % (e,), flush=True)
+        time.sleep(max(0.2, interval - (time.time() - t0)))
 
 
 def start_background_refresher():
-    """启动后台刷新线程（幂等）。app.py / server.py 启动时调用一次。"""
+    """启动每个源的独立轮询线程（幂等）。app.py 启动时调用一次。"""
     if getattr(start_background_refresher, "_started", False):
         return
     start_background_refresher._started = True
 
-    def loop():
-        while True:
-            t0 = time.time()
-            try:
-                _refresh_snapshot()
-            except Exception as e:
-                print("[warn] 快照刷新失败：%r" % (e,), flush=True)
-            # 上一轮结束后再等，上游慢的时候不会堆积任务
-            time.sleep(max(1.0, REFRESH_INTERVAL - (time.time() - t0)))
+    # 磁盘快照已经顶住了内容，先发布一版让 SSE 有个基线版本号
+    if _snap["posts"]:
+        _publish()
 
-    threading.Thread(target=loop, daemon=True, name="feed-refresher").start()
-
-
-_kick_lock = threading.Lock()
-_last_kick = 0.0
-
-
-def _kick_refresh():
-    """后台补刷一次（不阻塞调用方），带节流防止请求风暴把线程刷爆。"""
-    global _last_kick
-    now = time.time()
-    with _kick_lock:
-        if now - _last_kick < 10.0:
-            return
-        _last_kick = now
-    threading.Thread(target=_refresh_snapshot, daemon=True).start()
+    for src in SOURCES:
+        threading.Thread(target=_source_loop, args=(src,), daemon=True,
+                         name="poll-" + src["name"]).start()
+    threading.Thread(target=_disk_writer, daemon=True, name="snap-disk").start()
 
 
 def build_feed(hours):
     snap = _snap
-    # 只有在「一条都没有」时才同步抓一次；有数据就先返回（哪怕旧一点），
-    # 顺手叫醒后台补刷，绝不让访客对着白屏等上游。
     if not snap["posts"]:
-        snap = _refresh_snapshot()
-    elif time.time() - snap["t"] > REFRESH_INTERVAL * 4:
-        _kick_refresh()
+        # 冷启动兜底：各源线程正在抓首轮，这里只「等」不「抢」——
+        # 再发一轮只会让 12 个请求一起压上游，反而更慢。
+        deadline = time.time() + 12
+        while time.time() < deadline and not _snap["posts"]:
+            time.sleep(0.05)
+        snap = _snap
     posts = snap["posts"]
     if hours:
         cutoff = time.time() - hours * 3600
@@ -469,6 +629,7 @@ def build_feed(hours):
         "hours": hours,
         "sources": snap["sources"],
         "posts": posts,
+        "version": _ver,
         "snapshot_age": round(time.time() - snap["t"], 1),
     }
 
@@ -477,5 +638,3 @@ def build_feed(hours):
 _loaded = _load_snapshot_from_disk()
 if _loaded:
     _snap = _loaded
-
-

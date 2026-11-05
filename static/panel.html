@@ -282,6 +282,46 @@ function saveCache(d){
   }catch(e){}
 }
 
+// ===== 实时推送：任一源有新发言，服务端立刻通过 SSE 通知，不用等 5 秒轮询 =====
+// 连上就停掉轮询；断线自动退回 5 秒轮询兜底（EventSource 自身会重连）。
+let sseOk = false, streamVer = -1, loadTimer = null;
+
+function scheduleLoad(delay){
+  if(loadTimer) return;
+  loadTimer = setTimeout(()=>{ loadTimer = null; if(!paused) load(); }, delay || 180);
+}
+
+function setStreamAlive(on){
+  if(on === sseOk) return;
+  sseOk = on;
+  const dot = $("liveDot");
+  if(dot) dot.title = on ? "实时推送已连接" : "实时推送断开，已退回轮询";
+  if(on){
+    clearInterval(window._loop);
+    window._loop = null;
+  }else{
+    startTimers();          // 兜底轮询
+  }
+}
+
+function startStream(){
+  if(!window.EventSource) return;
+  try{
+    const es = new EventSource("/api/stream");
+    es.addEventListener("open", ()=> setStreamAlive(true));
+    es.addEventListener("tick", (e)=>{
+      setStreamAlive(true);
+      let v = -1;
+      try{ v = JSON.parse(e.data).ver; }catch(_){ return; }
+      if(streamVer === -1){ streamVer = v; return; }   // 首帧只记基线，避免重复拉一次
+      if(v === streamVer) return;
+      streamVer = v;
+      scheduleLoad(120);
+    });
+    es.addEventListener("error", ()=>{ setStreamAlive(false); });
+  }catch(e){ setStreamAlive(false); }
+}
+
 function loop(){
   if(!paused) load();
 }
@@ -324,6 +364,7 @@ document.querySelectorAll('button.tab').forEach(b=>{
 paintFromCache();
 load();
 startTimers();
+startStream();
 </script>
 </body>
 </html>
