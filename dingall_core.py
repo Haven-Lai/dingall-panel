@@ -382,6 +382,9 @@ _ver_lock = threading.Condition()
 _ver = 0
 _last_disk_save = 0.0
 _disk_dirty = False
+_prev_keys = None      # 上一版快照的帖子键集合（算增量用）
+_new_added = []        # 相对上一版新增的帖子，SSE 直接推给前端省一次跨境拉取
+_is_full = False       # True = 增量太多/没有基线，让前端老实拉一次全量
 
 _snap = {"t": 0.0, "posts": [], "sources": [], "updated": ""}
 
@@ -432,19 +435,28 @@ def _is_frozen(name):
 
 def _publish():
     """把所有源的当前结果合并成一份快照，并叫醒所有 SSE 订阅者。"""
-    global _snap, _ver, _disk_dirty
+    global _snap, _ver, _disk_dirty, _prev_keys, _new_added, _is_full
     all_posts = []
     for src in SOURCES:
         all_posts.extend(_src_posts.get(src["name"]) or [])
-    seen = set()
+    keys = set()
     uniq = []
     for p in all_posts:
         key = (p["source"], p["speaker"], p["time"], p["text"])
-        if key in seen:
+        if key in keys:
             continue
-        seen.add(key)
+        keys.add(key)
         uniq.append(p)
     uniq.sort(key=lambda p: p["ts"], reverse=True)
+    # 相对上一版新增的帖子：前端可以直接插到列表里，不必再拉一次全量
+    if _prev_keys is None:
+        added, full = [], True
+    else:
+        added = [p for p in uniq
+                 if (p["source"], p["speaker"], p["time"], p["text"]) not in _prev_keys]
+        full = len(added) > 12          # 一次新增太多就别推增量了，让前端拉全量更省事
+        if full:
+            added = []
     status = []
     for src in SOURCES:
         m = _src_status.get(src["name"]) or {}
@@ -455,6 +467,9 @@ def _publish():
             "updated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     with _ver_lock:
         _snap = snap
+        _prev_keys = keys
+        _new_added = added
+        _is_full = full
         _ver += 1
         _ver_lock.notify_all()
     # 只打脏标记，真正落盘交给 _disk_writer 低频去做：
@@ -486,9 +501,11 @@ def wait_version(last, timeout=20.0):
 
 
 def snapshot_meta():
-    """SSE 只推这个轻量摘要，正文仍由前端自己去拉 gzip 后的 /api/feed。"""
+    """SSE 推的载荷：源一变就把「新增的那几条」直接给前端，
+    省掉一次跨境 /api/feed 往返；增量太多或没有基线时让前端自己拉全量。"""
     with _ver_lock:
-        return {"ver": _ver, "total": len(_snap["posts"]), "updated": _snap["updated"]}
+        return {"ver": _ver, "total": len(_snap["posts"]), "updated": _snap["updated"],
+                "added": _new_added, "full": _is_full, "sources": _snap["sources"]}
 
 
 def poll_health():

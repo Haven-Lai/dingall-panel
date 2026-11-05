@@ -229,17 +229,24 @@ function tick(){
   if(cdLeft < 0) cdLeft = REFRESH_MS/1000;
 }
 
+function updStatus(sources){
+  const bad = (sources||[]).filter(s=>!s.ok);
+  $("statusLine").innerHTML = bad.length
+    ? `<span class="err">${bad.length} 个来源异常</span>` : `<span style="color:#22c55e">全部来源正常</span>`;
+  const dot = $("liveDot");
+  if(dot) dot.style.background = bad.length ? "#f59e0b" : "#22c55e";
+}
+
 async function load(){
   try{
     const r = await fetch("/api/feed?hours=" + currentHours, {cache:"no-store"});
     const d = await r.json();
     lastData = d;
+    dataFresh = true;
+    lastFullSync = Date.now();
     $("updated").textContent = d.updated || "--";
     $("total").textContent = d.total || 0;
-    const bad = (d.sources||[]).filter(s=>!s.ok);
-    $("statusLine").innerHTML = bad.length
-      ? `<span class="err">${bad.length} 个来源异常</span>` : `<span style="color:#22c55e">全部来源正常</span>`;
-    $("liveDot").style.background = bad.length ? "#f59e0b" : "#22c55e";
+    updStatus(d.sources || []);
     renderChips(d.sources||[]);
     renderPosts();
     if(d.posts && d.posts.length){
@@ -261,6 +268,7 @@ function paintFromCache(){
     const c = JSON.parse(localStorage.getItem(cacheKey()) || "null");
     if(!c || !c.posts || !c.posts.length) return false;
     lastData = c;
+    dataFresh = false;      // 缓存不是全量最新，别拿它当增量基准
     $("updated").textContent = (c.updated || "--") + "（缓存）";
     $("total").textContent = c.total || 0;
     renderChips(c.sources||[]);
@@ -285,6 +293,48 @@ function saveCache(d){
 // ===== 实时推送：任一源有新发言，服务端立刻通过 SSE 通知，不用等 5 秒轮询 =====
 // 连上就停掉轮询；断线自动退回 5 秒轮询兜底（EventSource 自身会重连）。
 let sseOk = false, streamVer = -1, loadTimer = null;
+let dataFresh = false;        // lastData 是否为服务端最新全量（缓存垫底时是 false）
+let lastFullSync = 0;         // 上次全量同步时刻，超时就不敢只信增量
+
+function postKey(p){
+  return (p.source||"") + "\u0001" + (p.speaker||"") + "\u0001" + (p.time||"") + "\u0001" + (p.text||"");
+}
+
+// 把 SSE 推来的新增帖子直接插进本地列表：省掉一次跨境拉取（1~2 秒）
+function applyDelta(m){
+  try{
+    if(!lastData || !lastData.posts) return false;
+    const cutoff = currentHours ? (Date.now()/1000 - currentHours*3600) : 0;
+    const have = new Set(lastData.posts.map(postKey));
+    const oldMax = lastData.posts.length ? lastData.posts[0].ts : null;
+    let n = 0;
+    for(const p of m.added){
+      if(!p || typeof p.ts !== "number") continue;
+      if(p.ts < cutoff) continue;                 // 不在当前时间窗口内的直接丢掉
+      const k = postKey(p);
+      if(have.has(k)) continue;
+      have.add(k);
+      lastData.posts.push(p);
+      n++;
+    }
+    if(!n) return false;
+    lastData.posts.sort((a,b)=> b.ts - a.ts);
+    lastData.total = lastData.posts.length;
+    if(m.updated) lastData.updated = m.updated;
+    if(m.sources && m.sources.length){
+      lastData.sources = m.sources;
+      renderChips(m.sources);
+      updStatus(m.sources);
+    }
+    prevMaxTs = oldMax;                            // 用旧基准判断谁是「新发言」以高亮
+    $("updated").textContent = lastData.updated || "--";
+    $("total").textContent = lastData.total;
+    renderPosts();
+    prevMaxTs = lastData.posts[0].ts;
+    saveCache(lastData);
+    return true;
+  }catch(e){ return false; }
+}
 
 function scheduleLoad(delay){
   if(loadTimer) return;
@@ -311,11 +361,21 @@ function startStream(){
     es.addEventListener("open", ()=> setStreamAlive(true));
     es.addEventListener("tick", (e)=>{
       setStreamAlive(true);
-      let v = -1;
-      try{ v = JSON.parse(e.data).ver; }catch(_){ return; }
-      if(streamVer === -1){ streamVer = v; return; }   // 首帧只记基线，避免重复拉一次
-      if(v === streamVer) return;
-      streamVer = v;
+      let m = null;
+      try{ m = JSON.parse(e.data); }catch(_){ return; }
+      if(streamVer === -1 || streamVer === m.ver){ streamVer = m.ver; return; }  // 首帧只记基线
+      streamVer = m.ver;
+      if(paused) return;   // 手动暂停时不改列表，但版本号照记，恢复后不会补一堆
+      // 增量够小、数据是全量拿的、且最近同步过 -> 直接本地插入，不必再拉一次
+      if(!m.full && dataFresh && m.added && m.added.length
+         && (Date.now() - lastFullSync) < 30000 && applyDelta(m)){
+        return;
+      }
+      if(!m.full && (!m.added || !m.added.length)){
+        // 只是来源状态变了（没新帖），刷一下状态条就好，别为这点事跨境拉 19KB
+        if(m.sources && m.sources.length && lastData){ lastData.sources = m.sources; renderChips(m.sources); updStatus(m.sources); }
+        return;
+      }
       scheduleLoad(120);
     });
     es.addEventListener("error", ()=>{ setStreamAlive(false); });
