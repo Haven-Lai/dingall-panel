@@ -39,8 +39,13 @@ OUTER_RE = re.compile(
     r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*【<b>(.*?)\s*<a[^>]*>.*?</b>】',
     re.S,
 )
-# 内层：发言人 + 短时间戳 MM-DD HH:MM:SS（同一行，可能带正文）
-HEADER_RE = re.compile(r'^(\S{1,20})\s+(\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*(.*)$')
+# 内层：发言人 + 时间戳（同一行，可能带正文）
+# 两种日期写法都要吃下：
+#   - 自定义/极致短线类：`发言人 MM-DD HH:MM:SS`（无年份，靠外层头补）
+#   - 金牌竞价群：`哈尔滨恐龙380   2026-11-05 08:55:05`（带完整年份）
+HEADER_RE = re.compile(
+    r'^(\S{1,24})\s+((?:\d{4}-)?\d{1,2}-\d{1,2} \d{1,2}:\d{2}:\d{2})\s*(.*)$'
+)
 # 内联发言人：【名字】正文（同一行，用于提取名字；允许行首空格）
 INLINE_SPK_RE = re.compile(r'^\s*【\s*(.+?)\s*】\s*(.*)$')
 # 角色发言行：短名字后跟冒号，单独成行（如「老师:」「群主:」）
@@ -55,6 +60,8 @@ OUTER_TIME_SOURCES = {"金牌竞价", "龙头舵主", "灯神"}
 STRIP_SPK_RE = re.compile(r'^\s*【\s*[^】]*\s*】\s*')
 # 纯发言人名（无标点、较短）
 NAME_RE = re.compile(r'^[\u4e00-\u9fffA-Za-z0-9_]{1,10}$')
+# 群标签最后一段若是这类词，说明是栏目/群名而非发言人（如「系统复盘」「闲聊群」）
+NON_PERSON_RE = re.compile(r'(群|计划|复盘|机器人|公告|通知|助手)$')
 PUNCT = set("。，、！？：；""''（）【】《》,.!?;: ")
 IMG_RE = re.compile(r'https?://[^\s"\'<>]+\.(?:jpg|jpeg|png|gif)(?:\?[^\s"\'<>]*)?|https?://static\.dingtalk\.com/media/[^\s"\'<>]+', re.I)
 
@@ -162,14 +169,22 @@ def parse_block(content, outer_time, source_name):
         # 发言人 + 正文
         speaker = ""
         body = ""
-        header_match = HEADER_RE.match(first)          # 自定义类：发言人 MM-DD HH:MM:SS
+        # 有些群（金牌竞价）块内首行是内层时间戳，真正的「发言人 + 时间戳」行在它下面，
+        # 所以首行是时间戳时把表头行往下挪一格再匹配。
+        hidx = idx
+        if INNER_TS_RE.match(first):
+            nxt = next((k for k in range(idx + 1, len(lines)) if lines[k].strip()), None)
+            if nxt is not None:
+                hidx = nxt
+        header_match = HEADER_RE.match(lines[hidx].strip())   # 群聊类：发言人 + MM-DD HH:MM:SS / YYYY-MM-DD HH:MM:SS
         if header_match:
             speaker = header_match.group(1)
-            its = parse_ts("%s-%s" % (year, header_match.group(2)))
-            rest = ([header_match.group(3)] if header_match.group(3) else []) + lines[idx + 1:]
+            stamp = header_match.group(2)
+            # 自带年份就直接用，否则（MM-DD HH:MM:SS）用外层头的年份补全
+            inner = stamp if re.match(r'^\d{4}-', stamp) else "%s-%s" % (year, stamp)
+            inner_ts = parse_ts_flex(inner)
+            rest = ([header_match.group(3)] if header_match.group(3) else []) + lines[hidx + 1:]
             body = "\n".join(rest)
-            inner = "%s-%s" % (year, header_match.group(2))
-            inner_ts = its
         else:
             # 找发言行：【名字】（内联）或 名字:（角色行，如 老师:）
             spk_line = None
@@ -212,15 +227,15 @@ def parse_block(content, outer_time, source_name):
 
         speaker = speaker.strip().strip("【】").strip()
         # 群标签类（灯神）：内联标签里塞的是「群名 · MM-DD HH:MM · 发言人」或「群名 · 发言人」，
-        # 只取最后一个像人名的分段，避免整串（如「计划群 · 10-21 09:58 · 灯湖」）塞进发言人栏，
-        # 否则前端「点发言人只看他」会碎成一地。取不到人名（如「板块 20261019 · 2/2」）就留空。
+        # 只认最后一段（那才是发言人的位置）。最后一段不是人名（如「∴」「10-21 09:58」）就留空，
+        # 绝不回退去取前面的群名——否则「闲聊群」「系统复盘」会变成发言人，
+        # 用户点它以为能看某个人，实际捞出来一堆互不相干的群发言。
         if "·" in speaker:
-            spk_tail = ""
-            for part in reversed([x.strip() for x in speaker.split("·")]):
-                if NAME_RE.match(part) and not part.isdigit():
-                    spk_tail = part
-                    break
-            speaker = spk_tail
+            tail = [x.strip() for x in speaker.split("·")][-1]
+            if NAME_RE.match(tail) and not tail.isdigit() and not NON_PERSON_RE.search(tail):
+                speaker = tail
+            else:
+                speaker = ""
         # 龙头舵主：发言人恒为「老师」，且「老师:」/「老师 」常顶在正文开头，统一强制并剥离，避免正文短句被误当发言人
         if source_name == "龙头舵主":
             speaker = "老师"
