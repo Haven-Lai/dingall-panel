@@ -69,6 +69,25 @@
     .grid, .grid.sub { grid-template-columns: repeat(2, 1fr); }
     .panels { grid-template-columns: 1fr; }
   }
+
+  /* 板块热度榜（涨停主线口径） */
+  .bk-wrap { display: flex; flex-direction: column; gap: 8px; }
+  .bk-row { background: #0f1726; border: 1px solid #1e293b; border-radius: 8px; padding: 9px 12px; }
+  .bk-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+  .bk-rank { display: inline-flex; width: 20px; height: 20px; align-items: center; justify-content: center;
+             border-radius: 5px; background: #334155; color: #cbd5e1; font-size: 12px; font-weight: 800; }
+  .bk-rank.r1 { background: #ef4444; color: #fff; }
+  .bk-rank.r2 { background: #f97316; color: #fff; }
+  .bk-rank.r3 { background: #eab308; color: #0b0f19; }
+  .bk-name { font-size: 14px; font-weight: 700; color: #e2e8f0; }
+  .bk-cnt { font-size: 12px; color: #ef4444; font-weight: 700; }
+  .bk-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .bk-chips .chip { background: #1e293b; border: 1px solid #334155; border-radius: 6px;
+                    padding: 3px 8px; font-size: 12px; color: #e2e8f0; }
+  .bk-chips .code { color: #64748b; font-size: 11px; margin-left: 4px; }
+  .bk-chips .lb { background: #ef4444; color: #fff; border-radius: 4px;
+                  padding: 0 5px; margin-left: 5px; font-size: 11px; font-weight: 700; }
+  .bk-chips .lb.lb1 { background: #475569; }
 </style>
 </head>
 <body>
@@ -152,6 +171,11 @@
       <span style="color:#b91c1c;">■ 81-100 极度亢奋区（防分化，去弱留强）</span>
     </div>
 
+    <div class="panel" style="margin-bottom:12px;">
+      <h3>板块热度榜 · 涨停主线 <span style="font-size:11px;color:#64748b;font-weight:400;">按板块内涨停家数排序（超短主线口径） · 附涨停个股与连板数</span></h3>
+      <div class="bk-wrap" id="sector-board"><div style="color:#475569;font-size:12px;">正在统计板块…</div></div>
+    </div>
+
     <div class="panels">
       <div class="panel">
         <h3>连板梯队</h3>
@@ -169,7 +193,7 @@
     </div>
 
     <div class="foot">
-      <div id="src">数据源：东方财富全市场行情 · 同花顺涨停池 · 腾讯指数　|
+      <div id="src">数据源：东方财富涨停池 / 跌停池 / 炸板池 / 板块 · 腾讯指数　|
         综合分含跌停/炸板/溢价/晋级（仅实时）；核心分含涨停/连板/一字（可回溯，用于日线）</div>
       <div id="sync">--</div>
     </div>
@@ -320,6 +344,11 @@ if (typeof echarts === 'undefined') {
     ]);
 
     const ztPool = (zt.data && zt.data.pool) || [];
+    // 东财涨停池返回 qdate（真实数据交易日）；周末/节假日会自动是最近交易日
+    const qd = (zt.data && zt.data.qdate) ? String(zt.data.qdate) : '';
+    const dataDate = (qd.length === 8)
+      ? qd.slice(0, 4) + '-' + qd.slice(4, 6) + '-' + qd.slice(6, 8)
+      : today;
     const dtPool = (dt.data && dt.data.pool) || [];
     const zbPool = (zb.data && zb.data.pool) || [];
     const ztTc = (zt.data && zt.data.total != null) ? zt.data.total : ztPool.length;
@@ -346,6 +375,22 @@ if (typeof echarts === 'undefined') {
       };
     });
 
+    // 板块热度榜：涨停池按所属行业聚合，按涨停家数降序（比板块涨幅更贴近超短主线）
+    const secMap = {};
+    ztPool.forEach(function (s) {
+      const k = s.hybk || '其他';
+      if (!secMap[k]) secMap[k] = { name: k, stocks: [], n: 0, maxh: 0 };
+      const h = s.lbc || 1;
+      secMap[k].stocks.push({ code: s.c, name: s.n, h: h });
+      secMap[k].n++;
+      secMap[k].maxh = Math.max(secMap[k].maxh, h);
+    });
+    const sectors = Object.keys(secMap).map(function (k) {
+      const b = secMap[k];
+      b.stocks.sort(function (a, c) { return c.h - a.h; });
+      return b;
+    }).sort(function (a, b) { return (b.n - a.n) || (b.maxh - a.maxh); }).slice(0, 8);
+
     const zbSum = ztTc + zbTc;
     const brokenRatio = zbSum > 0 ? +(zbTc / zbSum * 100).toFixed(1) : 0;
 
@@ -369,7 +414,8 @@ if (typeof echarts === 'undefined') {
       limit_down: dtTc, one_word_down: oneWordDown,
       broken: zbTc, broken_ratio: brokenRatio,
       max_height: maxHeight, ladder: ladder, boards: boards,
-      premium: +avgZdp.toFixed(2), prev_day: today, promo_rate: promoRate, prev_zt_total: ztTc,
+      premium: +avgZdp.toFixed(2), prev_day: dataDate, promo_rate: promoRate, prev_zt_total: ztTc,
+      data_date: dataDate, sectors: sectors,
       up: up, down: down, flat: flat, up5: up, down5: down, amount: +(amt / 1e8).toFixed(1),
       trading: tradingNow()
     };
@@ -469,10 +515,31 @@ if (typeof echarts === 'undefined') {
              '<td class="reason">' + (b.reason || '-') + '</td></tr>';
     }).join('') || '<tr><td colspan="6" style="color:#475569;">暂无数据</td></tr>';
 
+    // 板块热度榜
+    var sbEl = document.getElementById('sector-board');
+    if (sbEl) {
+      var secs = cur.sectors || [];
+      sbEl.innerHTML = secs.length ? secs.map(function (b, i) {
+        var chips = b.stocks.map(function (st) {
+          return '<span class="chip">' + st.name +
+                 '<span class="code">' + st.code + '</span>' +
+                 '<span class="lb' + (st.h > 1 ? '' : ' lb1') + '">' +
+                 (st.h > 1 ? st.h + '板' : '首板') + '</span></span>';
+        }).join('');
+        var rc = i === 0 ? ' r1' : (i === 1 ? ' r2' : (i === 2 ? ' r3' : ''));
+        return '<div class="bk-row"><div class="bk-head">' +
+               '<span class="bk-rank' + rc + '">' + (i + 1) + '</span>' +
+               '<span class="bk-name">' + b.name + '</span>' +
+               '<span class="bk-cnt">涨停 ' + b.n + ' 只</span></div>' +
+               '<div class="bk-chips">' + chips + '</div></div>';
+      }).join('') : '<div style="color:#475569;font-size:12px;">暂无涨停数据（非交易时段或接口暂不可用）</div>';
+    }
+
     const stale = d.stale ? ' <span style="color:#eab308;">（数据延迟）</span>' : '';
     document.getElementById('sync').innerHTML =
       '<span class="dot" style="background:' + (d.stale ? '#eab308' : '#22c55e') + '"></span>' +
-      '最后同步 ' + d.server_time + stale;
+      '最后同步 ' + d.server_time + '　｜　数据交易日 <b style="color:#e2e8f0;">' + (cur.data_date || '—') + '</b>' +
+      (cur.trading ? '（盘中实时）' : '（非交易时段 · 最近交易日收盘快照）') + stale;
   }
 
   function render(d) {
@@ -580,7 +647,9 @@ if (typeof echarts === 'undefined') {
       backgroundColor: 'transparent',
       title: {
         text: '情绪核心分日线 · 涨停/连板/一字口径（历史与今日同口径可比）',
-        left: 10, top: 6, textStyle: { fontSize: 13, color: '#94a3b8', fontWeight: 'normal' }
+        subtext: (klist && klist.length) ? '' : '历史日线依赖服务端历史库，当前暂不可用；上方实时指标不受影响',
+        left: 10, top: 6, textStyle: { fontSize: 13, color: '#94a3b8', fontWeight: 'normal' },
+        subtextStyle: { color: '#eab308', fontSize: 11 }
       },
       tooltip: {
         trigger: 'axis',
