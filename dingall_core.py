@@ -82,12 +82,232 @@ DAILY_SOURCES = {
 # 白名单里的源只保留指定发言人，其余帖子在解析后立刻丢弃——
 # 不占快照、不进 SSE 增量、来源计数和前端 chip 也一并变干净（网页和小程序同时生效，
 # 因为两边读的都是同一份 /api/feed）。
-# ⚠️ 发言人名字必须与上游完全一致（含大小写），写错就等于把这个源清空；
-#    群主一旦改昵称，这里也要跟着改，否则该源会变空。
-#    想恢复看全部发言：把这个源从字典里删掉即可，不需要动别的地方。
+# 想恢复看全部发言：把这个源从字典里删掉即可，不需要动别的地方。
+#
+# ⚠️ 关于「用 ID 而不是昵称」：上游 dingall 接口只吐纯文本昵称，
+#    整个响应里没有任何 userId / staffId / 头像 / 用户主页链接
+#    （602 个 <a> 全是同一个「只看Ta」，指向的是整个来源而不是某个人），
+#    所以这个接口上根本不存在可锚定的 ID。只能退而用「结构信号」锚定：
+#      1) 别名表：改名前后的昵称都认，改回去也还认
+#      2) 自动认领：昵称唯一确定地换了人时，自动把新昵称学进别名表并落盘，
+#         不需要人工来改代码（详见 _wl_learn）
+#      3) 认不出的时候临时显示全部，绝不把该源清空成 0 条
 SPEAKER_WHITELIST = {
     "金牌竞价": {"嘉兴可爱范"},
 }
+
+WHITELIST_AUTOLOCK = True   # 关掉就只认配置里的死名字（旧行为）
+WL_MIN_POSTS = 3            # 候选至少要有这么多条发言才算数，防止把路人误认成群主
+WL_MIN_SHARE = 0.25         # 候选至少要占多少比例（防止把新进群的活跃群友误认成群主）
+WL_DOMINANCE = 2.0          # 出现多个陌生名字时，第一名要领先第二名这么多倍
+WL_DOMINANCE_SHARE = 0.20   # 并且要占到全部发言的 20% 以上
+WL_GAP_SEC = 1800           # 白名单里的人超过这么久没说话（群里还在聊）→ 怀疑改名
+WL_RECENT_SEC = 1800        # 只在最近这段时间有人说话的名字里找候选
+WL_RECENT_MIN_POSTS = 5     # 最近这段时间发言太少就不做判断（深夜群很安静，容易误判）
+WL_CONFIRM_SEC = 90         # 候选要连续存活这么久才真正切过去
+WL_ALIAS_LIMIT = 3          # 每个源最多记 3 个历史昵称
+WL_KNOWN_LIMIT = 300        # 见过的昵称上限，防止无限膨胀
+
+WL_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "data", "speaker_whitelist.json")
+
+_wl_lock = threading.RLock()
+_wl_alias = {}   # 源 -> [学到的历史昵称]，新的在前
+_wl_known = {}   # 源 -> set(见过的所有昵称)，用来判断「谁是新冒出来的」
+_wl_state = {}   # 源 -> {"active":当前锚定, "mode":"ok|auto|unresolved", "unresolved":bool}
+_wl_pending = {} # 源 -> (候选昵称, 首次发现时间)，等确认用
+
+
+def _wl_load():
+    """读上次学到的别名表（丢了也不致命，会重新自动认领一次）。"""
+    try:
+        with open(WL_STATE_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        for k, v in (d.get("alias") or {}).items():
+            _wl_alias[k] = [str(x) for x in v if x][:WL_ALIAS_LIMIT]
+        for k, v in (d.get("known") or {}).items():
+            _wl_known[k] = set(str(x) for x in v)
+        if _wl_alias:
+            print("[whitelist] 已载入别名表：%s" % _wl_alias, flush=True)
+    except Exception:
+        pass
+
+
+def _wl_save():
+    try:
+        os.makedirs(os.path.dirname(WL_STATE_FILE), exist_ok=True)
+        tmp = WL_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"alias": _wl_alias,
+                       "known": {k: sorted(v) for k, v in _wl_known.items()}},
+                      f, ensure_ascii=False)
+        os.replace(tmp, WL_STATE_FILE)
+    except Exception:
+        pass
+
+
+def _wl_learn(name, posts):
+    """用一次「完整的解析结果」校正锚点。只在 200 全量解析之后调用。
+
+    核心判断：改名这件事在结构上是可识别的——白名单里的人一句都不说了，
+    同时冒出一个此前从没出现过的昵称。正常有人加入群时，白名单里的人照样在说话，
+    所以永远走不到这段分支，不会误伤。
+    """
+    cfg = SPEAKER_WHITELIST.get(name)
+    if not cfg or not posts:
+        return
+    cnt = {}
+    last_ts = {}
+    first_ts = {}
+    stamps = []
+    newest = 0.0
+    for p in posts:
+        sp = (p.get("speaker") or "").strip()
+        if not sp:
+            continue
+        cnt[sp] = cnt.get(sp, 0) + 1
+        ts = p.get("ts") or 0.0
+        if ts > last_ts.get(sp, 0.0):
+            last_ts[sp] = ts
+        if sp not in first_ts or ts < first_ts[sp]:
+            first_ts[sp] = ts
+        if ts > newest:
+            newest = ts
+        stamps.append((sp, ts))
+    if not cnt:
+        return
+    # 最近这段时间里「各说了多少」——注意不能拿总条数当近期条数，
+    # 闲聊大户的历史总量会把它算成一个假的高占比。
+    recent_cut = newest - WL_RECENT_SEC
+    recent_cnt = {}
+    for sp, ts in stamps:
+        if ts >= recent_cut:
+            recent_cnt[sp] = recent_cnt.get(sp, 0) + 1
+
+    with _wl_lock:
+        before = set(_wl_known.get(name) or ())
+        allowed = set(cfg) | set(_wl_alias.get(name) or [])
+        matched = sorted(((v, k) for k, v in cnt.items() if k in allowed), reverse=True)
+
+        if matched:
+            best = matched[0][1]
+            last_seen = max(last_ts.get(k, 0.0) for _, k in matched)
+            gap = newest - last_seen if newest else 0.0
+
+            # 情况 B：白名单里的人还在数据里，但已经很久没说话了，而群里还在聊。
+            # 上游一次吐 42 小时左右的发言，光等旧昵称「彻底滚出数据」要等一天多，
+            # 所以这里不看他「还在不在」，只看他「还说不说」。
+            if gap > WL_GAP_SEC:
+                cand = _wl_pick_recent(recent_cnt, cnt, first_ts, before, last_seen)
+                if cand:
+                    ok = _wl_confirm(name, cand)
+                    if ok:
+                        _wl_adopt(name, cand, cfg, before, set(cnt))
+                        return
+                    # 候选人还在确认中：先保持原样，但别把候选写进 known，
+                    # 否则下一轮它就不再是「陌生名字」，永远认不回来
+                    _wl_known[name] = (before | set(cnt)) - {cand}
+                    _wl_trim(name)
+                    _wl_state[name] = {"active": best, "mode": "ok" if best in cfg else "auto",
+                                       "unresolved": False, "pending": cand}
+                    return
+                _wl_pending.pop(name, None)
+
+            _wl_pending.pop(name, None)
+            _wl_state[name] = {"active": best,
+                               "mode": "ok" if best in cfg else "auto",
+                               "unresolved": False}
+            _wl_known[name] = before | set(cnt)
+            _wl_trim(name)
+            return
+
+        # 情况 A：整份数据里都找不到白名单里的人（改名前两天没说话 / 停机很久）
+        total = sum(cnt.values())
+        fresh = sorted(((v, k) for k, v in cnt.items()
+                        if k not in before and v >= WL_MIN_POSTS), reverse=True)
+        cand = None
+        if len(fresh) == 1 and fresh[0][0] >= total * WL_MIN_SHARE:
+            cand = fresh[0][1]                       # 只有一个陌生名字，且占比不低
+        elif len(fresh) >= 2:
+            top, second = fresh[0], fresh[1]
+            if top[0] >= WL_DOMINANCE * second[0] and top[0] >= total * WL_DOMINANCE_SHARE:
+                cand = top[1]                        # 一堆新名字里有个压倒性多的
+
+        if cand and WHITELIST_AUTOLOCK:
+            _wl_pending.pop(name, None)
+            _wl_adopt(name, cand, cfg, before, set(cnt))
+            return
+
+        # 认不出来（可能他真的没说话）：临时不过滤，宁可多看也不给个空面板。
+        # 此时不能把候选写进 known，否则下次就不再是「新名字」，永远认不回来了。
+        keep_out = {cand} if cand else set()
+        _wl_known[name] = (before | set(cnt)) - keep_out
+        _wl_trim(name)
+        _wl_state[name] = {"active": "", "mode": "unresolved", "unresolved": True}
+
+
+def _wl_pick_recent(recent_cnt, cnt, first_ts, before, last_seen):
+    """在「最近还在说话」的人里找改名的候选人。
+
+    要同时满足：此前从没出现过、是最近这段时间的主角、而且第一次开口
+    正好在白名单里那位销声之后——改名在时间轴上就是这个形状。
+    """
+    total_r = sum(recent_cnt.values())
+    if total_r < WL_RECENT_MIN_POSTS:
+        return None
+    fresh = [(c, sp) for sp, c in recent_cnt.items()
+             if sp not in before and c >= WL_MIN_POSTS
+             and first_ts.get(sp, 0.0) >= last_seen - 60]
+    if not fresh:
+        return None
+    fresh.sort(reverse=True)
+    top = fresh[0]
+    if top[0] < WL_MIN_SHARE * total_r:
+        return None
+    if len(fresh) >= 2 and top[0] < WL_DOMINANCE * fresh[1][0]:
+        return None
+    if not before:
+        # 完全没有历史（容器刚重启、磁盘别名表也丢了）时，「陌生名字」等于「所有人」，
+        # 光看最近一段时间可能把此刻话最多的人误当成群主——要求他在整份数据里也压倒性最多。
+        ranked = sorted(cnt.values(), reverse=True)
+        if cnt.get(top[1], 0) < ranked[0]:
+            return None
+        if len(ranked) >= 2 and ranked[0] < WL_DOMINANCE * ranked[1]:
+            return None
+    return top[1]
+
+
+def _wl_confirm(name, cand):
+    """候选要连续存活一段时间才真正切过去，防止把偶尔冒头的新群友误认成群主。"""
+    now = time.time()
+    prev = _wl_pending.get(name)
+    if prev and prev[0] == cand and now - prev[1] >= WL_CONFIRM_SEC:
+        _wl_pending.pop(name, None)
+        return True
+    if not prev or prev[0] != cand:
+        _wl_pending[name] = (cand, now)
+        print("[whitelist] %s 出现改名迹象，候选「%s」待确认" % (name, cand), flush=True)
+    return False
+
+
+def _wl_adopt(name, cand, cfg, before, cur):
+    aliases = _wl_alias.setdefault(name, [])
+    if cand in aliases:
+        aliases.remove(cand)
+    aliases.insert(0, cand)
+    del aliases[WL_ALIAS_LIMIT:]
+    _wl_state[name] = {"active": cand, "mode": "auto", "unresolved": False}
+    _wl_known[name] = before | cur
+    _wl_trim(name)
+    _wl_save()
+    print("[whitelist] %s 已确认改名：%s -> %s（自动锚定，无需人工干预）"
+          % (name, "、".join(sorted(cfg)), cand), flush=True)
+
+
+def _wl_trim(name):
+    s = _wl_known.get(name)
+    if s and len(s) > WL_KNOWN_LIMIT:
+        _wl_known[name] = set(sorted(s)[-WL_KNOWN_LIMIT:])
 
 
 def _filter_speakers(name, posts):
@@ -95,7 +315,31 @@ def _filter_speakers(name, posts):
     allow = SPEAKER_WHITELIST.get(name)
     if not allow:
         return posts
-    return [p for p in posts if (p.get("speaker") or "").strip() in allow]
+    with _wl_lock:
+        allowed = set(allow) | set(_wl_alias.get(name) or [])
+        st = _wl_state.get(name) or {}
+        unresolved = bool(st.get("unresolved"))
+    if unresolved:
+        # 认不出谁是群主时先全放行：空白面板比多几条闲聊更让人慌
+        return posts
+    return [p for p in posts if (p.get("speaker") or "").strip() in allowed]
+
+
+def _wl_summary():
+    out = {}
+    with _wl_lock:
+        for name, cfg in SPEAKER_WHITELIST.items():
+            st = _wl_state.get(name) or {}
+            out[name] = {"configured": sorted(cfg),
+                         "aliases": list(_wl_alias.get(name) or []),
+                         "active": st.get("active") or "",
+                         "mode": st.get("mode") or "init",
+                         "pending": (_wl_pending.get(name) or ("",))[0],
+                         "unresolved": bool(st.get("unresolved"))}
+    return out
+
+
+_wl_load()
 
 
 def _need_refresh(name, cached):
@@ -425,13 +669,16 @@ def _load_snapshot_from_disk():
         posts = d.get("posts") or []
         if not posts:
             return None
-        # 按源拆开回填：某个源首轮请求失败时，它也不会从看板上凭空消失
-        # 白名单源的旧微博要在这里再筛一遍：磁盘上是改造前写的快照时，
-        # 不筛会先冒出几秒别人发的垃圾，等首轮 200 才消失。
+        # 按源拆开回填：某个源首轮请求失败时，它也不会从看板上凭空消失。
+        # 磁盘上的帖子本来就写过一遍过滤结果，这里再筛一次是防止「改造前的旧快照」漏出别人的发言。
+        # 但注意：如果筛完一个源变空了，说明锚点对不上（群主改过昵称），此时保留原样——
+        # 宁可先显示上一次的结果，也不要冷启动就给个空白面板。
+        grp = {}
         for p in posts:
-            src_name = p.get("source") or ""
-            if _filter_speakers(src_name, [p]):
-                _src_posts.setdefault(src_name, []).append(p)
+            grp.setdefault(p.get("source") or "", []).append(p)
+        for src_name, items in grp.items():
+            kept = _filter_speakers(src_name, items) or items
+            _src_posts.setdefault(src_name, []).extend(kept)
         print("[info] 已加载磁盘快照：%s（%d 条）" % (d.get("updated", "?"), len(posts)), flush=True)
         return {"t": 0.0, "posts": posts, "sources": d.get("sources") or [],
                 "updated": d.get("updated") or "", "from_disk": True}
@@ -484,9 +731,16 @@ def _publish():
     status = []
     for src in SOURCES:
         m = _src_status.get(src["name"]) or {}
-        status.append({"name": src["name"], "ok": bool(m.get("ok")),
-                       "count": m.get("count", 0), "error": m.get("error") or "",
-                       "fetched": m.get("fetched") or ""})
+        item = {"name": src["name"], "ok": bool(m.get("ok")),
+                "count": m.get("count", 0), "error": m.get("error") or "",
+                "fetched": m.get("fetched") or ""}
+        if src["name"] in SPEAKER_WHITELIST:
+            st = _wl_state.get(src["name"]) or {}
+            # 前端据此提示：认不出群主时是「临时显示全部」，别让人以为白名单失效了
+            item["wl_unresolved"] = bool(st.get("unresolved"))
+            item["wl_active"] = st.get("active") or ""
+            item["wl_mode"] = st.get("mode") or "init"
+        status.append(item)
     snap = {"t": time.time(), "posts": uniq, "sources": status,
             "updated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     with _ver_lock:
@@ -542,7 +796,8 @@ def poll_health():
             out[n] = {"ok": m.get("ok"), "fetched": m.get("fetched"),
                       "count": m.get("count", 0), "etag": bool(_src_etag.get(n)),
                       "interval": FROZEN_POLL_INTERVAL if _is_frozen(n) else SOURCE_POLL_INTERVAL}
-        return {"version": _ver, "posts": len(_snap["posts"]), "sources": out}
+        return {"version": _ver, "posts": len(_snap["posts"]), "sources": out,
+                "whitelist": _wl_summary()}
 
 
 def _poll_source_once(src):
@@ -578,7 +833,11 @@ def _poll_source_once(src):
 
         # 200：内容确实变了，解析后替换该源
         txt = raw.decode("utf-8", "ignore")
-        posts = _filter_speakers(name, parse_posts(txt, name))
+        raw_posts = parse_posts(txt, name)
+        # 顺序不能反：先拿「完整解析结果」校正白名单锚点，再过滤。
+        # 反过来的话，群主刚改完昵称的那一轮会被旧昵称滤成 0 条，要等下一轮才恢复。
+        _wl_learn(name, raw_posts)
+        posts = _filter_speakers(name, raw_posts)
         with _src_lock:
             old = _src_posts.get(name)
             changed = True

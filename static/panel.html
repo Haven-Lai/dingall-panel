@@ -231,10 +231,15 @@ function tick(){
 
 function updStatus(sources){
   const bad = (sources||[]).filter(s=>!s.ok);
+  // 白名单源认不出群主时会临时显示全部，这里明说一句，免得误以为过滤坏了
+  const wl = (sources||[]).filter(s=>s.wl_unresolved);
   $("statusLine").innerHTML = bad.length
-    ? `<span class="err">${bad.length} 个来源异常</span>` : `<span style="color:#22c55e">全部来源正常</span>`;
+    ? `<span class="err">${bad.length} 个来源异常</span>`
+    : (wl.length
+        ? `<span style="color:#f59e0b">${wl.map(s=>s.name).join("、")} 昵称待识别，暂显示全部</span>`
+        : `<span style="color:#22c55e">全部来源正常</span>`);
   const dot = $("liveDot");
-  if(dot) dot.style.background = bad.length ? "#f59e0b" : "#22c55e";
+  if(dot) dot.style.background = (bad.length || wl.length) ? "#f59e0b" : "#22c55e";
 }
 
 async function load(){
