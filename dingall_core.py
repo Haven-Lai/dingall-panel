@@ -77,6 +77,26 @@ DAILY_SOURCES = {
     "金甲": {"window": ("09:00", "09:40")},
 }
 
+# ================= 发言人白名单（屏蔽群里的其他人） =================
+# 有些源本质是个「群」，几十号人在里面聊天，真正有价值的只有群主。
+# 白名单里的源只保留指定发言人，其余帖子在解析后立刻丢弃——
+# 不占快照、不进 SSE 增量、来源计数和前端 chip 也一并变干净（网页和小程序同时生效，
+# 因为两边读的都是同一份 /api/feed）。
+# ⚠️ 发言人名字必须与上游完全一致（含大小写），写错就等于把这个源清空；
+#    群主一旦改昵称，这里也要跟着改，否则该源会变空。
+#    想恢复看全部发言：把这个源从字典里删掉即可，不需要动别的地方。
+SPEAKER_WHITELIST = {
+    "金牌竞价": {"嘉兴可爱范"},
+}
+
+
+def _filter_speakers(name, posts):
+    """按白名单过滤某个源的帖子；没配置白名单的源原样返回。"""
+    allow = SPEAKER_WHITELIST.get(name)
+    if not allow:
+        return posts
+    return [p for p in posts if (p.get("speaker") or "").strip() in allow]
+
 
 def _need_refresh(name, cached):
     """每日定时源是否需要真正去请求上游。返回 False 表示直接复用缓存。"""
@@ -406,8 +426,12 @@ def _load_snapshot_from_disk():
         if not posts:
             return None
         # 按源拆开回填：某个源首轮请求失败时，它也不会从看板上凭空消失
+        # 白名单源的旧微博要在这里再筛一遍：磁盘上是改造前写的快照时，
+        # 不筛会先冒出几秒别人发的垃圾，等首轮 200 才消失。
         for p in posts:
-            _src_posts.setdefault(p.get("source") or "", []).append(p)
+            src_name = p.get("source") or ""
+            if _filter_speakers(src_name, [p]):
+                _src_posts.setdefault(src_name, []).append(p)
         print("[info] 已加载磁盘快照：%s（%d 条）" % (d.get("updated", "?"), len(posts)), flush=True)
         return {"t": 0.0, "posts": posts, "sources": d.get("sources") or [],
                 "updated": d.get("updated") or "", "from_disk": True}
@@ -554,7 +578,7 @@ def _poll_source_once(src):
 
         # 200：内容确实变了，解析后替换该源
         txt = raw.decode("utf-8", "ignore")
-        posts = parse_posts(txt, name)
+        posts = _filter_speakers(name, parse_posts(txt, name))
         with _src_lock:
             old = _src_posts.get(name)
             changed = True
