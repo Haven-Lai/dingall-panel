@@ -121,7 +121,7 @@
   <div id="klsection" style="display:none">
     <div class="sec-title">涨停 / 跌停家数走势 <span class="pill" id="klpill">加载中…</span><span class="desc">柱高＝当日家数，实心＝比前一交易日多，空心＝少</span></div>
     <div class="chartcard">
-      <div id="klchart"></div>
+      <div id="klchart"><div class="loading" style="padding:90px 0">正在计算涨跌停历史…</div></div>
       <div class="kllegend">
         <span class="kl-solid"></span>实心＝家数增加　<span class="kl-hollow"></span>空心＝家数减少　｜　
         上方 <b>涨停家数</b>（红）· 下方 <b>跌停家数</b>（绿）　｜　橙线为 5 日均值　｜　滚轮可缩放
@@ -657,20 +657,55 @@ function klOption(rows) {
   };
 }
 
-let _klChart = null, _klKey = "";
+let _klChart = null, _klKey = "", _klPending = null, _klRO = null, _klWatch = null;
+
+/* 面板把情绪看板放在 display:none 的 iframe 里（默认停在「大V发言」tab），
+ * 此时 iframe 不做布局，#klchart 的 clientWidth 是 0。这时候 echarts.init
+ * 会拿 0 宽建画布，而切 tab 只是改父页面的 display —— iframe 内部收不到
+ * window resize，图表就永远压成一条线。所以：
+ *   宽度为 0 时只存数据不画 -> 等尺寸出来再画。
+ * 用 ResizeObserver 盯尺寸，再加一个短轮询兜底（ResizeObserver 对
+ * display:none -> block 的触发行为在各浏览器上不完全一致）。
+ */
+function klStartWatch() {
+  if (_klWatch) return;
+  let ticks = 0;
+  _klWatch = setInterval(function () {
+    ticks++;
+    const b = document.getElementById("klchart");
+    if (b && b.clientWidth && b.clientHeight && _klPending) drawKline(_klPending);
+    if (_klChart || ticks > 240) { clearInterval(_klWatch); _klWatch = null; }
+  }, 500);
+}
+
+function klObserve(box) {
+  if (_klRO || !window.ResizeObserver) return;
+  _klRO = new ResizeObserver(function () {
+    const b = document.getElementById("klchart");
+    if (!b || !b.clientWidth || !b.clientHeight) return;
+    if (!_klChart) { if (_klPending) drawKline(_klPending); return; }
+    _klChart.resize();
+  });
+  _klRO.observe(box);
+}
 
 function drawKline(payload) {
   const box = document.getElementById("klchart");
   if (!box || !window.echarts) return;
+  _klPending = payload;
+
   const pill = document.getElementById("klpill");
   if (pill) pill.textContent = payload.days + " 个交易日";
 
   // 数据没变就别 setOption —— 40 秒一轮刷新里绝大多数时候是白重绘
   const key = payload.series.map(r => r.d + "|" + r.zc + "|" + r.dc).join(",");
   if (_klChart && _klKey === key) return;
-  _klKey = key;
 
-  // 万一容器被替换过（比如窗口缩放导致整块重排），旧实例挂在死 DOM 上要先扔掉
+  // 容器还没布局出来（见上面的说明），先等宽度
+  if (!box.clientWidth || !box.clientHeight) { klStartWatch(); return; }
+
+  _klKey = key;
+  // 万一容器被替换过，旧实例挂在死 DOM 上要先扔掉
   if (_klChart && _klChart.getDom() !== box) {
     try { _klChart.dispose(); } catch (e) {}
     _klChart = null;
@@ -679,6 +714,7 @@ function drawKline(payload) {
     box.innerHTML = "";
     _klChart = echarts.init(box);
   }
+  klObserve(box);
   _klChart.setOption(klOption(payload.series), true);
 }
 
