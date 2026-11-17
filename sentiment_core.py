@@ -456,7 +456,14 @@ _ZT_HIST_LOCK = threading.Lock()
 
 
 def fetch_pool_count(kind, ymd):
-    """查某一天的涨/跌停家数。kind='ZT' 或 'DT'；返回 {'tc':家数,'qdate':日期} 或 None。"""
+    """查某一天的涨/跌停家数。kind='ZT' 或 'DT'。
+
+    返回 {'tc': 家数, 'qdate': 日期, 'first': 首板数|None}；跌停池没有 'first'。
+
+    'first'＝连板数(lbc) 恰好为 1 的家数，从同一个响应的 pool 里数出来，
+    **不额外发请求**。算不出来时给 None 而不是 0 —— 0 会被读成「当天没有首板」，
+    跟真实情况正好相反。
+    """
     if kind not in ("ZT", "DT"):
         return None
     sort = "fbt%3Aasc" if kind == "ZT" else "fund%3Aasc"
@@ -466,16 +473,26 @@ def fetch_pool_count(kind, ymd):
     if not d or d.get("rc") != 0 or not d.get("data"):
         return None
     data = d["data"]
+    pool = data.get("pool") or []
     tc = to_num(data.get("tc"))
     if tc is None:
-        tc = len(data.get("pool") or [])
-    return {"tc": int(tc), "qdate": str(data.get("qdate") or "")}
+        tc = len(pool)
+    out = {"tc": int(tc), "qdate": str(data.get("qdate") or "")}
+    if kind == "ZT":
+        # pagesize=300 够用（历史峰值 125 家）。真被截断就宁可给 None，
+        # 也不要拿半页明细算出一个偏小的首板数。
+        truncated = int(tc) > len(pool)
+        lbc = [to_num(p.get("lbc")) for p in pool]
+        lbc = [v for v in lbc if v is not None]
+        out["first"] = (sum(1 for v in lbc if v == 1)
+                        if (lbc and not truncated) else None)
+    return out
 
 
 def _zt_hist_zt(dstr):
-    """返回 (日期, 涨停家数) 或 None。先只抓涨停池，跌停池留给有数据的日期。"""
+    """返回 (日期, 涨停家数, 首板数) 或 None。跌停池留给有数据的日期再补。"""
     r = fetch_pool_count("ZT", dstr.replace("-", ""))
-    return (dstr, r["tc"]) if r else None
+    return (dstr, r["tc"], r.get("first")) if r else None
 
 
 def _zt_hist_dt(dstr):
@@ -495,14 +512,15 @@ def _zt_hist_full(days):
     # 两段并发：先筛涨停池，再只对有效日期补跌停池（省一半请求）
     with ThreadPoolExecutor(max_workers=ZT_HIST_WORKERS) as ex:
         zt_rows = [x for x in ex.map(_zt_hist_zt, dates) if x]
-    valid = [(d, zt) for d, zt in zt_rows if zt > 0]
+    valid = [(d, zt, fi) for d, zt, fi in zt_rows if zt > 0]
     if not valid:
         return []
     with ThreadPoolExecutor(max_workers=ZT_HIST_WORKERS) as ex:
         dt_vals = list(ex.map(lambda x: _zt_hist_dt(x[0]), valid))
 
-    rows = [{"d": d, "zt": int(zt), "dt": int(dt)}
-            for (d, zt), dt in zip(valid, dt_vals)]
+    rows = [{"d": d, "zt": int(zt), "dt": int(dt),
+             "first": (int(fi) if fi is not None else None)}
+            for (d, zt, fi), dt in zip(valid, dt_vals)]
     rows.sort(key=lambda x: x["d"])
     return rows
 
@@ -530,8 +548,12 @@ def _build_zt_history_locked(days):
     today_str = datetime.now().strftime("%Y-%m-%d")
     cache = STATE.get("zt_hist")
 
-    # 跨天 / 从没抓过 / 历史缓存太旧 -> 全量重扫
-    need_full = (not cache
+    # 跨天 / 从没抓过 / 历史缓存太旧 / 旧缓存里没有 first 字段（加首板线之前
+    # 存的）-> 全量重扫。漏掉最后这条的话，首板线会一直是空的，
+    # 而且要等到跨天才自己好，排查起来极容易误判成「东财没数据」。
+    rows_ready = bool(cache and cache.get("days")
+                      and all("first" in r for r in cache["days"]))
+    need_full = (not cache or not rows_ready
                  or cache.get("day") != today_str
                  or now - float(cache.get("full_ts") or 0) > ZT_FULL_TTL)
 
@@ -552,7 +574,9 @@ def _build_zt_history_locked(days):
         if today_row and today_row[1] > 0:
             rows = [r for r in cache["days"] if r["d"] != today_str]
             rows.append({"d": today_str, "zt": int(today_row[1]),
-                         "dt": int(_zt_hist_dt(today_str))})
+                         "dt": int(_zt_hist_dt(today_str)),
+                         "first": (int(today_row[2])
+                                   if today_row[2] is not None else None)})
             rows.sort(key=lambda x: x["d"])
             cache["days"] = rows
             save_json(ZT_HIST_FILE, {"day": cache["day"],
@@ -563,11 +587,16 @@ def _build_zt_history_locked(days):
 
 
 def zt_kline_payload(limit=30):
-    """给前端的「每日收盘涨跌停家数」序列（同坐标系双折线）。
+    """给前端的「每日收盘涨跌停家数 + 首板数」序列（同坐标系三条线）。
 
     东财涨停池/跌停池的 tc 字段本身就是「该交易日截至当时的家数」：查历史日期
     拿到的是那天收盘的定值，查今天拿到的是实时值。所以这个序列天然就是收盘口径，
     不用再自己做日线合成。
+
+    first（首板数）来自涨停池每条记录的 lbc（连板数）字段，取 lbc==1 的家数。
+    它和涨停家数是父子关系（首板 ⊆ 涨停），同轴画出来一眼能看出涨停的成色：
+    涨停多但首板少＝资金在抱团高位、新资金不敢接；涨停少但全是首板＝冰点里
+    有新资金试探。这是超短最该看的结构信号，单看总数看不出来。
 
     唯一需要区分的是「今天还没收盘」——那天数字会跟着盘中跳动，标 final=False，
     前端用空心点画出来，免得把盘中数当成收盘数。
@@ -584,6 +613,7 @@ def zt_kline_payload(limit=30):
             "d": r["d"],
             "zt": int(r["zt"]),
             "dt": int(r["dt"]),
+            "first": (int(r["first"]) if r.get("first") is not None else None),
             "live": is_today,                        # 兼容旧前端字段
             "final": (not is_today) or closed_now,   # 是否已是收盘定值
         })
@@ -594,7 +624,7 @@ def zt_kline_payload(limit=30):
         "days": len(tail),
         "today": today_str,
         "closed": closed_now,
-        "source": "东方财富 涨停池/跌停池（与看板卡片同口径）",
+        "source": "东方财富 涨停池/跌停池（与看板卡片同口径；首板＝连板数 1 的家数）",
         "series": tail,
         "updated": now.strftime("%H:%M:%S"),
     }

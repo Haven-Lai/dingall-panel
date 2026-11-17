@@ -79,7 +79,7 @@
   .err { background: #fff3f3; color: #c0392b; border-radius: 10px; padding: 14px 16px; font-size: 13px; }
   .note { background: #fffaf0; color: #8a6d00; border-radius: 10px; padding: 12px 14px; font-size: 12.5px; margin-bottom: 14px; border: 1px solid #f4e3b0; }
 
-  /* 涨跌停家数走势（同坐标系双折线） */
+  /* 涨跌停家数 + 首板数走势（同坐标系三条折线） */
   .chartcard { background: #fff; border-radius: 12px; padding: 10px 8px 6px; box-shadow: 0 2px 8px rgba(0,0,0,.05); margin-bottom: 16px; }
   #klchart { width: 100%; height: 400px; }
   .kllegend { font-size: 11.5px; color: #8a90a0; padding: 0 10px 8px; line-height: 1.9; }
@@ -89,6 +89,7 @@
     vertical-align: 3px; margin-right: 5px;
   }
   .kl-dot-r { background: #e03b3b; }
+  .kl-dot-o { background: #f59e0b; }
   .kl-dot-g { background: #1aa251; }
 </style>
 </head>
@@ -119,13 +120,17 @@
        #content，图表 DOM 在里面的话每 40 秒刷新就被销毁重建、闪一下。
        拆出来之后图表只初始化一次，数据变了才重绘。 -->
   <div id="klsection" style="display:none">
-    <div class="sec-title">涨停 / 跌停家数（每日收盘） <span class="pill" id="klpill">加载中…</span><span class="desc">两条线同一坐标系，红线在上＝情绪好，两线收窄＝情绪转弱</span></div>
+    <div class="sec-title">涨停 / 首板 / 跌停家数（每日收盘） <span class="pill" id="klpill">加载中…</span><span class="desc">红绿两线收窄＝情绪转弱；红线与橙线间距宽＝新资金在扩散，贴得死紧＝全靠高位连板</span></div>
     <div class="chartcard">
       <div id="klchart"><div class="loading" style="padding:90px 0">正在计算涨跌停历史…</div></div>
       <div class="kllegend">
         <span class="kl-dot kl-dot-r"></span><b>涨停家数</b>　
+        <span class="kl-dot kl-dot-o"></span><b>首板数量</b>　
         <span class="kl-dot kl-dot-g"></span><b>跌停家数</b>　｜　
         取每个交易日<b>收盘</b>时的家数　｜　空心点＝当日还没收盘，数字仍在变　｜　滚轮可缩放
+        <br><b>首板</b>＝当天首次涨停的家数（连板数 1），是涨停数的子集。
+        看的是<b>橙线与红线的间距</b>：涨停多而首板跟不上＝资金在抱团高位连板、新资金不敢接手；
+        涨停少但几乎全是首板＝冰点里已有资金试盘。
       </div>
     </div>
   </div>
@@ -502,6 +507,10 @@ function klCacheGet() {
   try {
     const o = JSON.parse(localStorage.getItem(KL_CACHE) || "null");
     if (!o || !o.ready || !o.series || !o.series.length || o.day !== todayStr()) return null;
+    // 加「首板」之前存下的缓存里没有 first 字段，直接拿来用会让首板线整条空着。
+    // 判一下字段在不在，不在就丢掉重拉（五个小时内只多一次请求）。
+    const s0 = o.series[0];
+    if (s0 && !("first" in s0)) return null;
     const last = o.series[o.series.length - 1];
     const ttl = (last && last.live && !last.final) ? KL_MAX_AGE_LIVE : KL_MAX_AGE;
     if (Date.now() - (o.ts || 0) < ttl) return o;
@@ -538,21 +547,27 @@ function klOption(rows) {
   // undefined，ECharts 连 y 轴范围都算不出来，整个绘图区空白且不报错。
   const ZT = r => (r.zt != null ? r.zt : r.zc);
   const DT = r => (r.dt != null ? r.dt : r.dc);
-  const ztC = rows.map(ZT), dtC = rows.map(DT);
+  // 首板数＝涨停池里连板数(lbc) 为 1 的家数。老缓存没有这个字段，给 null 让线
+  // 断开，绝不能兜成 0 —— 0 会画成「那天一只首板都没有」，跟事实正好相反。
+  const FS = r => (r.first != null ? r.first : (r.fs != null ? r.fs : null));
+  const ztC = rows.map(ZT), dtC = rows.map(DT), fsC = rows.map(FS);
   const lastIdx = rows.length - 1;
 
   // 折线取「每个交易日收盘时的家数」。家数本身就是一天一个定值 ——
   // 柱状要靠实心/空心去暗示方向，蜡烛更是没有真实开高低收，
   // 折线直接把这十几天的路径连出来，趋势一眼看到底。
-  // 两条线共用同一 y 轴：红线在高位、绿线贴地＝情绪健康；
+  // 三条线共用同一 y 轴：红线在高位、绿线贴地＝情绪健康；
   // 红线掉下来和绿线靠近/交叉＝退潮，这是最该减仓的时候。
-  const RED = "#e03b3b", GREEN = "#1aa251";
+  // 首板（橙）是涨停（红）的子集，永远在红线下方，要看的是两线的间距：
+  // 间距宽＝新资金主导、赚钱效应在扩散；贴得死紧＝涨停全靠高位连板堆出来的。
+  const RED = "#e03b3b", GREEN = "#1aa251", ORANGE = "#f59e0b";
 
   // 当日还没收盘（15:00 前）就画空心点：那个数字还在变，不能当收盘数看。
   // 空心靠「白填充 + 彩色描边」实现，不要用 symbol:"emptyCircle" ——
   // 那是 legend 的图标名，不是 series 的 symbol 类型，塞进 data 项会让整条线
   // 静默画不出来（不报错、不提示，排查起来极费劲）。
   const withLiveDot = (vals, color) => vals.map((v, i) => {
+    if (v == null) return null;
     const r = rows[i];
     if (i === lastIdx && r.live && !r.final) {
       return {
@@ -577,7 +592,7 @@ function klOption(rows) {
     legend: {
       top: 2, right: 6, itemWidth: 13, itemHeight: 8, itemGap: 16,
       textStyle: { color: "#5a6072", fontSize: 11.5 },
-      data: ["涨停家数", "跌停家数"]
+      data: ["涨停家数", "首板数量", "跌停家数"]
     },
     tooltip: {
       trigger: "axis",
@@ -599,6 +614,8 @@ function klOption(rows) {
         const cz = dz > 0 ? RED : (dz < 0 ? GREEN : "#8a90a0");
         const cd = dd > 0 ? GREEN : (dd < 0 ? RED : "#8a90a0");
         const ratio = DT(r) ? (ZT(r) / DT(r)).toFixed(1) : "∞";
+        const f = FS(r);
+        const fShare = (f != null && ZT(r)) ? Math.round(f * 100 / ZT(r)) : null;
         const tag = r.live
           ? (r.final ? ' <span style="color:#2563eb">今日收盘</span>'
                      : ' <span style="color:#f59e0b">盘中·未收盘</span>')
@@ -606,6 +623,11 @@ function klOption(rows) {
         return '<b>' + r.d + '</b>' + tag
           + '<br><span style="color:' + RED + '">●</span> 涨停 <b>' + ZT(r) + '</b> 家'
           + (prev ? ' <span style="color:' + cz + '">' + sgn(dz) + '</span>' : "")
+          + (f != null
+              ? '<br><span style="color:' + ORANGE + '">●</span> 首板 <b>' + f + '</b> 家'
+                + (fShare != null
+                    ? ' <span style="color:#8a90a0">占涨停 ' + fShare + '%</span>' : "")
+              : '')
           + '<br><span style="color:' + GREEN + '">●</span> 跌停 <b>' + DT(r) + '</b> 家'
           + (prev ? ' <span style="color:' + cd + '">' + sgn(dd) + '</span>' : "")
           + '<br><span style="color:#8a90a0">涨跌停比 ' + ratio + '</span>';
@@ -651,6 +673,16 @@ function klOption(rows) {
         itemStyle: { color: RED },
         areaStyle: area(RED),
         z: 6
+      },
+      {
+        // 首板是涨停的子集，形状必然跟红线很像，所以：把它画细一点、放在上层
+        // （z 更高），并且不填面积 —— 否则两块面积叠在一起会糊成一片。
+        name: "首板数量", type: "line", xAxisIndex: 0, yAxisIndex: 0,
+        data: withLiveDot(fsC, ORANGE),
+        smooth: false, symbol: "circle", symbolSize: 4, showSymbol: true,
+        lineStyle: { width: 1.7, color: ORANGE },
+        itemStyle: { color: ORANGE },
+        z: 7
       },
       {
         name: "跌停家数", type: "line", xAxisIndex: 0, yAxisIndex: 0,
