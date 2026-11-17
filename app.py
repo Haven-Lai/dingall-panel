@@ -179,6 +179,21 @@ class Handler(BaseHTTPRequestHandler):
                 }
             return self._send(200, json.dumps(payload, ensure_ascii=False))
 
+        if path in ("/api/zt-kline", "/api/ztkline"):
+            # 情绪看板的涨跌停家数走势图：数据走东财涨停池/跌停池（与页面卡片同口径），
+            # 由服务端抓 + 缓存，前端只发这一个请求 —— 否则浏览器要发 30 个跨域
+            # JSONP 才能凑出 15 天，既占满并发又容易被东财限流。
+            try:
+                limit = int(parse_qs(u.query).get("limit", ["30"])[0])
+            except Exception:
+                limit = 30
+            limit = max(5, min(60, limit))
+            try:
+                data = sentiment_core.zt_kline_payload(limit=limit)
+            except Exception as e:
+                data = {"ready": False, "error": str(e)[:200], "series": []}
+            return self._send(200, json.dumps(data, ensure_ascii=False))
+
         if path in ("/api/health", "/healthz"):
             with LOCK:
                 return self._send(200, json.dumps({

@@ -424,12 +424,186 @@ def build_kline(history, today_str, today_ohlc, limit=30):
     return out
 
 
+# ---------------------------------------------------------------- 涨跌停家数 K 线
+#
+# 情绪看板前端（static/sentiment.html）的数字来自东方财富的涨停池 / 跌停池（data.tc），
+# 这里用**同一个接口**回补历史，保证「今日卡片上的 42 家」和「K 线最后一根 42」是同一口径。
+# 别换成同花顺涨停池 —— 那个口径的涨停家数会跟卡片对不上，用户一眼就看出矛盾。
+#
+# ⚠️ 两个池的排序字段不通用：涨停池认 fbt（首次封板时间），
+#    跌停池如果也传 sort=fbt:asc，会返回 rc=0 / tc 正常但 pool 为空 ——
+#    看着像「跌停池没数据」，实际是排序字段不被接受。跌停池必须用 fund:asc。
+#
+# ⚠️ 历史深度只有约 15 个交易日：再往前 tc 一律返回 0、pool 为空。
+#    这不是 bug，也不需要"修复"，多扫几天拿到多少算多少。
+
+EX_BASE = "https://push2ex.eastmoney.com/"
+EX_UT = "7eea3edcaed734bea9cbfc24409ed989"
+EX_HEADERS = {"Referer": "https://quote.eastmoney.com/"}
+
+ZT_HIST_FILE = os.path.join(DATA_DIR, "zt_history.json")
+
+# 历史日一整天不会变，但当日那根要跟着盘中跳动，所以拆成两档 TTL
+ZT_FULL_TTL = 1800
+ZT_LIVE_TTL = 20
+
+# 历史深度 ~15 个交易日，扫 22 个工作日刚好盖住；并发 10 实测 0.5 秒内扫完。
+# 这两个数一起决定冷启动时 K 线图多久能出来，别随手调大。
+ZT_HIST_DAYS = 22
+ZT_HIST_WORKERS = 10
+
+_ZT_HIST_LOCK = threading.Lock()
+
+
+def fetch_pool_count(kind, ymd):
+    """查某一天的涨/跌停家数。kind='ZT' 或 'DT'；返回 {'tc':家数,'qdate':日期} 或 None。"""
+    if kind not in ("ZT", "DT"):
+        return None
+    sort = "fbt%3Aasc" if kind == "ZT" else "fund%3Aasc"
+    url = ("%sgetTopic%sPool?ut=%s&dpt=wz.ztzt&Pageindex=0&pagesize=300&sort=%s&date=%s"
+           % (EX_BASE, kind, EX_UT, sort, ymd))
+    d = http_json(url, EX_HEADERS, timeout=8, retries=2)
+    if not d or d.get("rc") != 0 or not d.get("data"):
+        return None
+    data = d["data"]
+    tc = to_num(data.get("tc"))
+    if tc is None:
+        tc = len(data.get("pool") or [])
+    return {"tc": int(tc), "qdate": str(data.get("qdate") or "")}
+
+
+def _zt_hist_zt(dstr):
+    """返回 (日期, 涨停家数) 或 None。先只抓涨停池，跌停池留给有数据的日期。"""
+    r = fetch_pool_count("ZT", dstr.replace("-", ""))
+    return (dstr, r["tc"]) if r else None
+
+
+def _zt_hist_dt(dstr):
+    r = fetch_pool_count("DT", dstr.replace("-", ""))
+    return (r["tc"] if r else 0)
+
+
+def _zt_hist_full(days):
+    """并发扫最近 days 个工作日，返回有数据的 [{d, zt, dt}]（升序）。
+
+    东财池的历史深度实测只有 ~15 个交易日，再往前 tc 恒为 0。所以这里默认只扫
+    22 个工作日（刚好盖住 + 一点缓冲）：扫太多纯属给东财送了 30 个必然返回 0
+    的请求，白等半分钟。真要更长历史，把 days 调大即可，逻辑不用动。
+    """
+    dates = list(reversed(last_trading_dates(days)))   # 旧 -> 新
+
+    # 两段并发：先筛涨停池，再只对有效日期补跌停池（省一半请求）
+    with ThreadPoolExecutor(max_workers=ZT_HIST_WORKERS) as ex:
+        zt_rows = [x for x in ex.map(_zt_hist_zt, dates) if x]
+    valid = [(d, zt) for d, zt in zt_rows if zt > 0]
+    if not valid:
+        return []
+    with ThreadPoolExecutor(max_workers=ZT_HIST_WORKERS) as ex:
+        dt_vals = list(ex.map(lambda x: _zt_hist_dt(x[0]), valid))
+
+    rows = [{"d": d, "zt": int(zt), "dt": int(dt)}
+            for (d, zt), dt in zip(valid, dt_vals)]
+    rows.sort(key=lambda x: x["d"])
+    return rows
+
+
+def _zt_hist_load():
+    d = load_json(ZT_HIST_FILE, None)
+    if isinstance(d, dict) and isinstance(d.get("days"), list) and d["days"]:
+        return {"day": str(d.get("day") or ""), "full_ts": float(d.get("full_ts") or 0),
+                "days": d["days"], "live_ts": 0.0}
+    return None
+
+
+def build_zt_history(days=ZT_HIST_DAYS):
+    """最近可得的交易日涨跌停家数（升序），内存 + 磁盘双缓存。
+
+    加锁：bootstrap 预热和 /api/zt-kline 的首次请求可能同时进来，
+    不锁的话两边会各自并发扫 45 个请求，把东财怼到限流。
+    """
+    with _ZT_HIST_LOCK:
+        return _build_zt_history_locked(days)
+
+
+def _build_zt_history_locked(days):
+    now = time.time()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    cache = STATE.get("zt_hist")
+
+    # 跨天 / 从没抓过 / 历史缓存太旧 -> 全量重扫
+    need_full = (not cache
+                 or cache.get("day") != today_str
+                 or now - float(cache.get("full_ts") or 0) > ZT_FULL_TTL)
+
+    if need_full:
+        rows = _zt_hist_full(days)
+        if rows:
+            cache = {"day": today_str, "full_ts": now, "days": rows, "live_ts": now}
+            STATE["zt_hist"] = cache
+            save_json(ZT_HIST_FILE, {"day": today_str, "full_ts": now, "days": rows})
+        elif cache:
+            # 全量扫失败（东财限流/断网）就继续用旧缓存，别把图清空
+            cache["full_ts"] = now
+        else:
+            return []
+    elif now - float(cache.get("live_ts") or 0) > ZT_LIVE_TTL:
+        # 同一天内：历史日不会变，只刷新当日那根
+        today_row = _zt_hist_zt(today_str)
+        if today_row and today_row[1] > 0:
+            rows = [r for r in cache["days"] if r["d"] != today_str]
+            rows.append({"d": today_str, "zt": int(today_row[1]),
+                         "dt": int(_zt_hist_dt(today_str))})
+            rows.sort(key=lambda x: x["d"])
+            cache["days"] = rows
+            save_json(ZT_HIST_FILE, {"day": cache["day"],
+                                     "full_ts": cache["full_ts"], "days": rows})
+        cache["live_ts"] = now
+
+    return (STATE.get("zt_hist") or {}).get("days") or []
+
+
+def zt_kline_payload(limit=30):
+    """给前端的涨跌停 K 线数据。OHLC 口径：O=前一交易日收盘，C=当日收盘，无影线。
+
+    「家数」这种日频单值序列本来就没有真实开高低收，硬造影线反而误导 ——
+    所以 O 取前一日收盘，蜡烛实体长度＝家数的增减幅度，颜色＝方向。
+    当日那根是活的：盘中每 20 秒跟着最新涨停数跳动。
+    """
+    rows = build_zt_history(days=ZT_HIST_DAYS)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    out = []
+    prev_zc = prev_dc = None
+    for r in rows:
+        zc, dc = int(r["zt"]), int(r["dt"])
+        zo = prev_zc if prev_zc is not None else zc
+        do_ = prev_dc if prev_dc is not None else dc
+        out.append({
+            "d": r["d"], "zt": zc, "dt": dc,
+            "live": r["d"] == today_str,
+            "zo": zo, "zc": zc, "zl": min(zo, zc), "zh": max(zo, zc),
+            "do": do_, "dc": dc, "dl": min(do_, dc), "dh": max(do_, dc),
+        })
+        prev_zc, prev_dc = zc, dc
+
+    tail = out[-limit:]
+    return {
+        "ready": bool(tail),
+        "days": len(tail),
+        "today": today_str,
+        "source": "东方财富 涨停池/跌停池（与看板卡片同口径）",
+        "series": tail,
+        "updated": datetime.now().strftime("%H:%M:%S"),
+    }
+
+
 # ---------------------------------------------------------------- 全局状态
 
 STATE = {
     "snapshot": None,      # 最近一次成功的完整数据
     "intraday": [],        # 今日情绪分时 [{time, score}]
     "history": {},         # 历史交易日 {date: {c, zt, maxh, yz, approx}}
+    "zt_hist": None,       # 涨跌停家数历史缓存（见 build_zt_history）
     "last_ok": 0,
     "last_error": "",
     "refresh_count": 0,
@@ -583,6 +757,11 @@ def refresh_worker():
 
 
 def bootstrap():
+    # 涨跌停 K 线先读盘：容器重启后不用等东财重扫就能立刻出图
+    try:
+        STATE["zt_hist"] = _zt_hist_load()
+    except Exception:
+        STATE["zt_hist"] = None
     STATE["history"] = load_json(HISTORY_FILE, {})
     # 分时序列跨进程重启不续接：避免旧公式 / 跨会话残留点污染今日 K 线，
     # 每次启动从当前值起重新累计（当日 K 线由本会话分时点实时构建）。
@@ -591,6 +770,14 @@ def bootstrap():
     if backfill_history(STATE["history"], days=30):
         save_json(HISTORY_FILE, STATE["history"])
     print("历史交易日：%d 天" % len(STATE["history"]))
+
+    # 涨跌停家数历史放最后，就算东财限流也不该拖垮上面的情绪日线
+    try:
+        rows = build_zt_history(days=ZT_HIST_DAYS)
+        print("涨跌停家数历史：%d 天（%s ~ %s）"
+              % (len(rows), rows[0]["d"] if rows else "-", rows[-1]["d"] if rows else "-"))
+    except Exception as e:
+        print("[warn] 涨跌停家数历史拉取失败：%r" % (e,))
 
 
 # ---------------------------------------------------------------- HTTP

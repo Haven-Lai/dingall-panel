@@ -78,6 +78,18 @@
   .loading { text-align: center; color: #8a90a0; padding: 30px; font-size: 14px; }
   .err { background: #fff3f3; color: #c0392b; border-radius: 10px; padding: 14px 16px; font-size: 13px; }
   .note { background: #fffaf0; color: #8a6d00; border-radius: 10px; padding: 12px 14px; font-size: 12.5px; margin-bottom: 14px; border: 1px solid #f4e3b0; }
+
+  /* 涨跌停家数 K 线 */
+  .chartcard { background: #fff; border-radius: 12px; padding: 10px 8px 6px; box-shadow: 0 2px 8px rgba(0,0,0,.05); margin-bottom: 16px; }
+  #klchart { width: 100%; height: 410px; }
+  .kllegend { font-size: 11.5px; color: #8a90a0; padding: 0 10px 8px; line-height: 1.9; }
+  .kllegend b { color: #3a3f4d; }
+  .kl-solid, .kl-hollow {
+    display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+    vertical-align: -1px; margin-right: 4px;
+  }
+  .kl-solid { background: #e03b3b; }
+  .kl-hollow { background: #fff; border: 1.3px solid #e03b3b; }
 </style>
 </head>
 <body>
@@ -102,6 +114,22 @@
   <div id="content">
     <div class="loading">正在拉取实时行情…（首次加载约 2-4 秒）</div>
   </div>
+
+  <!-- 涨跌停走势图刻意放在 #content 之外：render() 每次都用 innerHTML 重写
+       #content，图表 DOM 在里面的话每 40 秒刷新就被销毁重建、闪一下。
+       拆出来之后图表只初始化一次，数据变了才重绘。 -->
+  <div id="klsection" style="display:none">
+    <div class="sec-title">涨停 / 跌停家数走势 <span class="pill" id="klpill">加载中…</span><span class="desc">柱高＝当日家数，实心＝比前一交易日多，空心＝少</span></div>
+    <div class="chartcard">
+      <div id="klchart"></div>
+      <div class="kllegend">
+        <span class="kl-solid"></span>实心＝家数增加　<span class="kl-hollow"></span>空心＝家数减少　｜　
+        上方 <b>涨停家数</b>（红）· 下方 <b>跌停家数</b>（绿）　｜　橙线为 5 日均值　｜　滚轮可缩放
+      </div>
+    </div>
+  </div>
+
+  <div id="boards"></div>
 
   <div class="disclaimer">
     本仪表盘仅作辅助参考，环境判定由公开量化规则自动计算，不构成投资建议。市场有风险，投资需谨慎。
@@ -308,17 +336,24 @@ function render(data) {
     <div class="card"><div class="label">主要指数</div><div class="idxbox" style="margin-top:2px">${idxBox}</div></div>
   </div>`;
 
-  html += `<div class="sec-title">板块热度榜 · 涨停主线 <span class="pill">TOP ${data.sectors ? data.sectors.length : 0}</span><span class="desc">按板块内涨停家数排序 · 附全部涨停个股与连板数</span></div>`;
-  html += renderBoard(data.sectors, "sector");
-
-  html += `<div class="sec-title">概念题材热度榜 <span class="pill">TOP ${data.boards ? data.boards.length : 0}</span><span class="desc">取自概念涨幅榜前12个真题材，按板块内涨停家数重排 · 仅作题材视角补充，主线判断看上方主榜</span></div>`;
-  html += renderBoard(data.boards, "concept");
-
   document.getElementById("content").innerHTML = html;
+
+  let bh = "";
+  bh += `<div class="sec-title">板块热度榜 · 涨停主线 <span class="pill">TOP ${data.sectors ? data.sectors.length : 0}</span><span class="desc">按板块内涨停家数排序 · 附全部涨停个股与连板数</span></div>`;
+  bh += renderBoard(data.sectors, "sector");
+
+  bh += `<div class="sec-title">概念题材热度榜 <span class="pill">TOP ${data.boards ? data.boards.length : 0}</span><span class="desc">取自概念涨幅榜前12个真题材，按板块内涨停家数重排 · 仅作题材视角补充，主线判断看上方主榜</span></div>`;
+  bh += renderBoard(data.boards, "concept");
+  document.getElementById("boards").innerHTML = bh;
+
+  document.getElementById("klsection").style.display = "block";
   document.getElementById("status").textContent = "已更新 " + data.time;
+  loadKline();
 }
 
 function showError(msg) {
+  document.getElementById("klsection").style.display = "none";
+  document.getElementById("boards").innerHTML = "";
   document.getElementById("content").innerHTML = `<div class="err">数据获取失败：${esc(msg)}<br>可能原因：1）网络不通；2）浏览器拦截跨域请求（换 Chrome 打开）；3）数据源临时限流（点「立即刷新」重试）。<br><br>手动判断法：同花顺「涨停板」专区看涨停/跌停/连板数，涨停≥50且跌停≤5＝环境好；涨停&lt;20或跌停≥15＝收手。</div>`;
 }
 
@@ -429,6 +464,243 @@ async function load() {
     btn.disabled = false; btn.textContent = "立即刷新";
   }
 }
+
+/* ============ 涨跌停家数 K 线 ============
+ * 数据来自服务端 /api/zt-kline（服务端抓东财涨停池/跌停池并缓存）。
+ * 为什么不让浏览器自己抓：凑 20 天要发 40+ 个跨域 JSONP，既占满浏览器
+ * 到东财的并发（本页板块榜还要用它），又容易撞限流。服务端抓一次全页共用。
+ */
+const KL_CACHE = "kl_zt_v1";
+const KL_MAX_AGE = 5 * 60 * 1000;      // 盘中 5 分钟内复用，避免每次刷新都请求
+let _echartsP = null;
+
+function todayStr() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
+
+function loadEcharts() {
+  if (window.echarts) return Promise.resolve();
+  if (_echartsP) return _echartsP;
+  _echartsP = new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = "/echarts.min.js";
+    s.onload = () => res();
+    s.onerror = () => { _echartsP = null; rej(new Error("图表库加载失败")); };
+    document.head.appendChild(s);
+  });
+  return _echartsP;
+}
+
+function klCacheGet() {
+  try {
+    const o = JSON.parse(localStorage.getItem(KL_CACHE) || "null");
+    if (o && o.ready && o.series && o.series.length && o.day === todayStr()
+        && Date.now() - (o.ts || 0) < KL_MAX_AGE) return o;
+  } catch (e) {}
+  return null;
+}
+
+async function fetchKline() {
+  const hit = klCacheGet();
+  if (hit) return hit;
+
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 25000);
+  let j;
+  try {
+    const r = await fetch("/api/zt-kline?limit=30", { cache: "no-store", signal: ctl.signal });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    j = await r.json();
+  } finally { clearTimeout(timer); }
+
+  if (!j || !j.ready || !Array.isArray(j.series) || !j.series.length) {
+    throw new Error((j && j.error) || "暂无涨跌停历史");
+  }
+  try {
+    localStorage.setItem(KL_CACHE, JSON.stringify(Object.assign({}, j, { ts: Date.now(), day: todayStr() })));
+  } catch (e) {}
+  return j;
+}
+
+function klOption(rows) {
+  const cats = rows.map(r => r.d.slice(5));            // 11-17
+  const ztC = rows.map(r => r.zc), dtC = rows.map(r => r.dc);
+
+  // 为什么是柱状图而不是蜡烛：涨停「家数」是日频单值，没有真实的开高低收。
+  // 硬拿「前收→收盘」凑蜡烛的话，相邻两根实体共用同一个端点会完全重叠 ——
+  // 11-02 收 125 家、11-03 收 48 家，画出来两根一样高，读到的是假信息。
+  // 柱高＝家数绝对值，实心＝比前一交易日多、空心＝少，趋势和数值一次看全。
+  const bars = (vals, solid) => vals.map((v, i) => {
+    const prev = i > 0 ? vals[i - 1] : null;
+    const up = prev == null || v >= prev;
+    return {
+      value: v,
+      itemStyle: up
+        ? { color: solid, borderColor: solid, borderWidth: 1 }
+        : { color: "#ffffff", borderColor: solid, borderWidth: 1.3 }
+    };
+  });
+
+  const ma = (arr, n) => arr.map((_, i) => {
+    if (i < n - 1) return null;
+    let s = 0;
+    for (let k = i - n + 1; k <= i; k++) s += arr[k];
+    return +(s / n).toFixed(1);
+  });
+
+  const RED = "#e03b3b", GREEN = "#1aa251", ORANGE = "#f59e0b";
+  const axisCommon = {
+    axisLine: { lineStyle: { color: "#e3e8f0" } },
+    axisTick: { show: false },
+    splitLine: { show: false }
+  };
+
+  return {
+    animation: false,
+    textStyle: { fontFamily: '-apple-system,"PingFang SC","Microsoft YaHei",sans-serif' },
+    title: [
+      { text: "涨停家数", left: 46, top: 2, textStyle: { fontSize: 11.5, fontWeight: 600, color: RED } },
+      { text: "跌停家数", left: 46, top: 194, textStyle: { fontSize: 11.5, fontWeight: 600, color: GREEN } }
+    ],
+    grid: [
+      { left: 44, right: 14, top: 24, height: 148 },
+      { left: 44, right: 14, top: 216, height: 112 }
+    ],
+    axisPointer: { link: [{ xAxisIndex: "all" }] },
+    tooltip: {
+      trigger: "axis",
+      backgroundColor: "rgba(255,255,255,.97)",
+      borderColor: "#e3e8f0",
+      borderWidth: 1,
+      padding: [8, 11],
+      textStyle: { color: "#1f2330", fontSize: 12 },
+      axisPointer: { type: "shadow", shadowStyle: { color: "rgba(37,99,235,.06)" } },
+      formatter: function (ps) {
+        const i = ps && ps[0] ? ps[0].dataIndex : -1;
+        const r = rows[i];
+        if (!r) return "";
+        const prev = i > 0 ? rows[i - 1] : null;
+        const dz = prev ? r.zc - prev.zc : 0;
+        const dd = prev ? r.dc - prev.dc : 0;
+        const sgn = v => (v > 0 ? "+" : "") + v;
+        // 涨停增＝红（转强），跌停增＝绿（恶化），都按情绪好坏上色
+        const cz = dz > 0 ? RED : (dz < 0 ? GREEN : "#8a90a0");
+        const cd = dd > 0 ? GREEN : (dd < 0 ? RED : "#8a90a0");
+        const ratio = r.dc ? (r.zc / r.dc).toFixed(1) : "∞";
+        return '<b>' + r.d + '</b>' + (r.live ? ' <span style="color:#2563eb">今日</span>' : "")
+          + '<br>涨停 <b style="color:' + RED + '">' + r.zc + '</b> 家'
+          + (prev ? ' <span style="color:' + cz + '">' + sgn(dz) + '</span>' : "")
+          + '<br>跌停 <b style="color:' + GREEN + '">' + r.dc + '</b> 家'
+          + (prev ? ' <span style="color:' + cd + '">' + sgn(dd) + '</span>' : "")
+          + '<br><span style="color:#8a90a0">涨停/跌停比 ' + ratio + '</span>';
+      }
+    },
+    xAxis: [
+      Object.assign({}, axisCommon, {
+        type: "category", data: cats, gridIndex: 0, boundaryGap: true,
+        axisLabel: { show: false }
+      }),
+      Object.assign({}, axisCommon, {
+        type: "category", data: cats, gridIndex: 1, boundaryGap: true,
+        axisLabel: {
+          fontSize: 10.5, interval: "auto",
+          color: (v, i) => (rows[i] && rows[i].live) ? "#2563eb" : "#8a90a0",
+          formatter: (v, i) => (rows[i] && rows[i].live) ? "今日" : v
+        }
+      })
+    ],
+    yAxis: [
+      {
+        // 柱状图必须从 0 起算：scale:true 会切到 30 起，72 家和 125 家看起来能差一倍
+        gridIndex: 0, min: 0, splitNumber: 3,
+        axisLabel: { color: "#8a90a0", fontSize: 10.5 },
+        splitLine: { lineStyle: { color: "#f2f4f8" } }
+      },
+      {
+        gridIndex: 1, min: 0, splitNumber: 2,
+        axisLabel: { color: "#8a90a0", fontSize: 10.5 },
+        splitLine: { lineStyle: { color: "#f2f4f8" } }
+      }
+    ],
+    dataZoom: [
+      { type: "inside", xAxisIndex: [0, 1], start: 0, end: 100 },
+      {
+        type: "slider", xAxisIndex: [0, 1], height: 12, bottom: 8, showDetail: false,
+        borderColor: "transparent", backgroundColor: "#f5f7fa",
+        fillerColor: "rgba(37,99,235,.12)", handleStyle: { color: "#2563eb" },
+        dataBackground: { lineStyle: { color: "#dfe4ee" }, areaStyle: { color: "#f0f3f9" } },
+        textStyle: { color: "#a0a6b4", fontSize: 9 }
+      }
+    ],
+    series: [
+      {
+        name: "涨停家数", type: "bar", xAxisIndex: 0, yAxisIndex: 0,
+        data: bars(ztC, RED), barMaxWidth: 26
+      },
+      {
+        name: "涨停MA5", type: "line", xAxisIndex: 0, yAxisIndex: 0,
+        data: ma(ztC, 5), smooth: true, showSymbol: false, z: 5,
+        lineStyle: { width: 1.4, color: ORANGE }, itemStyle: { color: ORANGE }
+      },
+      {
+        name: "跌停家数", type: "bar", xAxisIndex: 1, yAxisIndex: 1,
+        data: bars(dtC, GREEN), barMaxWidth: 26
+      },
+      {
+        name: "跌停MA5", type: "line", xAxisIndex: 1, yAxisIndex: 1,
+        data: ma(dtC, 5), smooth: true, showSymbol: false, z: 5,
+        lineStyle: { width: 1.4, color: ORANGE }, itemStyle: { color: ORANGE }
+      }
+    ]
+  };
+}
+
+let _klChart = null, _klKey = "";
+
+function drawKline(payload) {
+  const box = document.getElementById("klchart");
+  if (!box || !window.echarts) return;
+  const pill = document.getElementById("klpill");
+  if (pill) pill.textContent = payload.days + " 个交易日";
+
+  // 数据没变就别 setOption —— 40 秒一轮刷新里绝大多数时候是白重绘
+  const key = payload.series.map(r => r.d + "|" + r.zc + "|" + r.dc).join(",");
+  if (_klChart && _klKey === key) return;
+  _klKey = key;
+
+  // 万一容器被替换过（比如窗口缩放导致整块重排），旧实例挂在死 DOM 上要先扔掉
+  if (_klChart && _klChart.getDom() !== box) {
+    try { _klChart.dispose(); } catch (e) {}
+    _klChart = null;
+  }
+  if (!_klChart) {
+    box.innerHTML = "";
+    _klChart = echarts.init(box);
+  }
+  _klChart.setOption(klOption(payload.series), true);
+}
+
+async function loadKline() {
+  const box = document.getElementById("klchart");
+  if (!box) return;
+  try {
+    const data = await fetchKline();
+    await loadEcharts();
+    drawKline(data);
+  } catch (e) {
+    // 已经画出来了就保持原样，别因为一次拉取失败把图擦掉
+    if (_klChart) return;
+    const cur = document.getElementById("klchart");
+    if (cur) {
+      cur.innerHTML = '<div class="loading" style="padding:80px 0">涨跌停走势暂不可用（'
+        + esc(e && e.message ? e.message : e) + '）<br>点右上角「立即刷新」重试</div>';
+    }
+  }
+}
+
+window.addEventListener("resize", () => { if (_klChart) _klChart.resize(); });
 
 document.getElementById("refresh").addEventListener("click", load);
 load();
