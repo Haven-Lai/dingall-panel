@@ -563,37 +563,40 @@ def _build_zt_history_locked(days):
 
 
 def zt_kline_payload(limit=30):
-    """给前端的涨跌停 K 线数据。OHLC 口径：O=前一交易日收盘，C=当日收盘，无影线。
+    """给前端的「每日收盘涨跌停家数」序列（同坐标系双折线）。
 
-    「家数」这种日频单值序列本来就没有真实开高低收，硬造影线反而误导 ——
-    所以 O 取前一日收盘，蜡烛实体长度＝家数的增减幅度，颜色＝方向。
-    当日那根是活的：盘中每 20 秒跟着最新涨停数跳动。
+    东财涨停池/跌停池的 tc 字段本身就是「该交易日截至当时的家数」：查历史日期
+    拿到的是那天收盘的定值，查今天拿到的是实时值。所以这个序列天然就是收盘口径，
+    不用再自己做日线合成。
+
+    唯一需要区分的是「今天还没收盘」——那天数字会跟着盘中跳动，标 final=False，
+    前端用空心点画出来，免得把盘中数当成收盘数。
     """
     rows = build_zt_history(days=ZT_HIST_DAYS)
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    closed_now = now.strftime("%H:%M") >= "15:00"     # A 股 15:00 收盘
 
     out = []
-    prev_zc = prev_dc = None
     for r in rows:
-        zc, dc = int(r["zt"]), int(r["dt"])
-        zo = prev_zc if prev_zc is not None else zc
-        do_ = prev_dc if prev_dc is not None else dc
+        is_today = r["d"] == today_str
         out.append({
-            "d": r["d"], "zt": zc, "dt": dc,
-            "live": r["d"] == today_str,
-            "zo": zo, "zc": zc, "zl": min(zo, zc), "zh": max(zo, zc),
-            "do": do_, "dc": dc, "dl": min(do_, dc), "dh": max(do_, dc),
+            "d": r["d"],
+            "zt": int(r["zt"]),
+            "dt": int(r["dt"]),
+            "live": is_today,                        # 兼容旧前端字段
+            "final": (not is_today) or closed_now,   # 是否已是收盘定值
         })
-        prev_zc, prev_dc = zc, dc
 
     tail = out[-limit:]
     return {
         "ready": bool(tail),
         "days": len(tail),
         "today": today_str,
+        "closed": closed_now,
         "source": "东方财富 涨停池/跌停池（与看板卡片同口径）",
         "series": tail,
-        "updated": datetime.now().strftime("%H:%M:%S"),
+        "updated": now.strftime("%H:%M:%S"),
     }
 
 
