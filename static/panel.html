@@ -22,13 +22,13 @@
         border:1px solid var(--border);background:#fff;font-size:12px;cursor:pointer;user-select:none;
         transition:.15s;}
   .chip .c-dot{width:8px;height:8px;border-radius:50%;}
-  .chip.off{opacity:.62;}
+  .chip.off{opacity:.45;}                       /* 灰 = 此刻不显示，点一下就能回来 */
   .chip.off .c-dot{background:#c3c8d0 !important;}
   .chip .cbox{width:14px;height:14px;flex:none;border:1.5px solid #cfd5dd;border-radius:4px;
               background:#fff;display:inline-flex;align-items:center;justify-content:center;
               font-size:10px;line-height:1;color:#fff;margin-right:-1px;}
-  .chip.on{border-color:#c7d2fe;}
-  .chip.on .cbox{background:#3b82f6;border-color:#3b82f6;}
+  .chip.chk{border-color:#c7d2fe;background:#f8faff;}   /* 蓝框 = 每次打开默认看它 */
+  .chip.chk .cbox{background:#3b82f6;border-color:#3b82f6;}
   .chip .cbox{position:relative;}
   .chip .cbox::after{content:"";position:absolute;inset:-7px -6px;}  /* 小方块太难点，热区放大 */
   .chip .nm{white-space:nowrap;}
@@ -156,16 +156,15 @@ const $ = id => document.getElementById(id);
 
 function esc(s){return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
 
-// ===== 选手筛选：色标前的勾选框 =====
-// 7 个选手全铺开没法看。每颗色标前面一个勾选框，勾完点后面的「确定」记住，
-// 以后每次打开就只看这几位。勾选即时生效（所见即所得），同时写本地，不会因为
-// 忘了点确定就白选——「确定」负责收工反馈，以及「一个都没勾」时兜底成全选。
-// 存 {"visible":[...], "seen":[...]}：seen 是上次保存时已知的全部源名，
-// 用来识别「后来新加的选手」——没见过的源默认给看，绝不因为一次旧选择就把新选手漏掉。
+// ===== 选手筛选：两套独立状态，别合并 =====
+//   ① 当前显示（visible）：点框框里的选手名字 = 开关，可多选，盘中随时切，**不写本地**
+//   ② 默认显示（pending）：选手框框外面那个勾选框 + 「确定」，决定「每次打开网页看哪几位」
+// 用户 2026-11-19 反复强调：盘中切人是临时动作，绝不能顺手改掉默认设置。
 const VIS_KEY = "dingall_visible_sources_v1";
-let visible = null;        // Set<源名>；null = 还没有本地记录（首次打开）
-let seenSources = [];      // 上次保存时已知的源名
-let hasSaved = false;      // 本地是否存过选择记录
+let visible = null;        // Set<源名>：此刻正在显示哪几位
+let pending = null;        // Set<源名>：勾选框的状态（= 待保存的默认）
+let seenSources = [];      // 上次保存时已知的源名（用于识别后来新增的选手）
+let hasSaved = false;      // 本地是否存过默认
 
 function loadVisible(){
   try{
@@ -174,35 +173,40 @@ function loadVisible(){
     const o = JSON.parse(raw);
     if(!o || !Array.isArray(o.visible)) return;
     visible = new Set(o.visible);
+    pending = new Set(o.visible);
     seenSources = Array.isArray(o.seen) ? o.seen : [];
     hasSaved = true;
   }catch(e){}
 }
 
+function ensureVisible(){
+  // 首次打开：两套状态都从空开始，让用户自己勾、自己挑
+  if(!visible) visible = new Set();
+  if(!pending) pending = new Set(visible);
+}
+
+// 只保存「默认」，永远不保存「当前显示」——这正是两套状态的意义
 function saveVisible(){
-  if(!visible) return;
+  if(!pending) return;
   try{
-    localStorage.setItem(VIS_KEY, JSON.stringify({visible:[...visible], seen:seenSources}));
+    localStorage.setItem(VIS_KEY, JSON.stringify({visible:[...pending], seen:seenSources}));
   }catch(e){}
 }
 
 function isVisible(name){ return !visible || visible.has(name); }
+function isDefault(name){ return !pending || pending.has(name); }
 
-function ensureVisible(){
-  // 首次使用：从「一个都不勾」开始，让用户自己挑要看的几位。
-  // 别默认全勾——那等于让用户去点掉 5 个不要的，跟「太多选手了」的诉求正好相反。
-  if(!visible) visible = new Set();
-}
-
-// 新源（不在上次 seen 里）自动并入可见：宁可多显示一个，也别让人以为那源没数据
-// ⚠️ 只在「用户以前存过选择」时做。首次使用时 seenSources 是空的，
-//    不加 hasSaved 判断的话会把全部源都当成新源塞进空集合，等于又默认全选了。
+// 新源（不在上次 seen 里）自动并入：默认和当前都要有，别让人以为新源没数据。
+// ⚠️ 只在「用户以前存过默认」时做；首次 seenSources 为空会把全部源当新源。
 function syncNewSources(sources){
   if(!sources || !sources.length) return false;
   let changed = false;
-  if(hasSaved && visible){
+  if(hasSaved && visible && pending){
     sources.forEach(s=>{
-      if(!seenSources.includes(s.name) && !visible.has(s.name)){ visible.add(s.name); changed = true; }
+      if(!seenSources.includes(s.name)){
+        if(!pending.has(s.name)){ pending.add(s.name); changed = true; }
+        if(!visible.has(s.name)){ visible.add(s.name); changed = true; }
+      }
     });
   }
   seenSources = sources.map(s=>s.name);
@@ -210,51 +214,65 @@ function syncNewSources(sources){
   return changed;
 }
 
-// 点勾选框：只改这一颗的样式，不重绘整排，免得点一下色标全跳一下
-function toggleSource(name, el){
+// 【当前显示】点框框里的选手名字：开关这一位，可多选。不碰默认、不写本地。
+function toggleSource(name){
   ensureVisible();
   const on = !visible.has(name);
   if(on) visible.add(name); else visible.delete(name);
-  saveVisible(); hasSaved = true;
+  // 把正在「只看」的那位藏起来会得到一片空白，顺手退出只看
+  if(!on && focus && focus.kind==="source" && focus.value===name) focus = null;
+  if(lastData) renderChips(lastData.sources||[]);
+  renderPosts();
+}
+
+// 【默认】点框框外面的勾选框：只改勾选状态，等用户点「确定」才落盘。
+function toggleDefault(name, el){
+  ensureVisible();
+  const on = !pending.has(name);
+  if(on) pending.add(name); else pending.delete(name);
   if(el){
-    el.classList.toggle("on", on);
-    el.classList.toggle("off", !on);
+    el.classList.toggle("chk", on);
     const b = el.querySelector(".cbox");
     if(b) b.textContent = on ? "✓" : "";
   }
   updPickSum();
-  renderPosts();
 }
 
+// 【确定】：把勾选框这套存成默认，同时让当前显示也按它来
 function confirmPick(){
   ensureVisible();
-  // 一个都没勾就点确定 -> 兜底成全选。宁可全给你看，也别留一片空白让人以为看板挂了。
-  if(visible.size === 0){
+  // 一个都没勾就点确定 -> 兜底成全选。宁可全给你看，也别留一片空白。
+  if(pending.size === 0){
     const all = ((lastData && lastData.sources) || []).map(s=>s.name);
-    if(all.length){
-      visible = new Set(all); saveVisible(); hasSaved = true;
-      if(lastData) renderChips(lastData.sources||[]);
-      renderPosts();
-    }
-  }else{
-    saveVisible(); hasSaved = true;
+    if(all.length) pending = new Set(all);
   }
+  if(!pending.size) return;
+  saveVisible();
+  hasSaved = true;
+  visible = new Set(pending);        // 确定之后，当前显示也跟着这套走
+  if(lastData) renderChips(lastData.sources||[]);
+  renderPosts();
   const btn = $("pickOk");
   if(btn){
     btn.classList.add("done");
     btn.textContent = "✓ 已记住";
     setTimeout(()=>{ btn.classList.remove("done"); btn.textContent = "确定"; }, 1400);
   }
-  updPickSum();
 }
 
 function updPickSum(){
   const srcs = (lastData && lastData.sources) || [];
   if(!srcs.length) return;
-  const n = srcs.filter(s=>isVisible(s.name)).length;
-  $("pickInfo").innerHTML = n
-    ? `默认只看 <b>${n}</b>/${srcs.length} 位 · 点选手名字可临时只看一位`
-    : `<span style="color:#f59e0b">一位都没勾 —— 勾上要看的选手，再点「确定」</span>`;
+  const shown = srcs.filter(s=>isVisible(s.name)).length;
+  const def   = srcs.filter(s=>isDefault(s.name)).length;
+  if(!def && !shown){
+    $("pickInfo").innerHTML =
+      `<span style="color:#f59e0b">先把每次打开想看的选手勾上，点「确定」；平时点选手名字随时开关</span>`;
+    return;
+  }
+  $("pickInfo").innerHTML = (shown === def)
+    ? `默认看 <b>${def}</b>/${srcs.length} 位 · 点选手名字可随时开关`
+    : `正在看 <b>${shown}</b>/${srcs.length} 位 · 默认 <b>${def}</b> 位`;
 }
 
 function renderChips(sources){
@@ -266,24 +284,25 @@ function renderChips(sources){
   box.innerHTML = "";
   sources.forEach(s=>{
     const c = COLORS[s.name] || "#888";
-    const on = isVisible(s.name);
+    const chk  = isDefault(s.name);     // 勾选框 = 默认
+    const shown = isVisible(s.name);    // 灰不灰 = 此刻显示与否
     const active = (focus && focus.kind==="source" && focus.value===s.name) ? " active" : "";
     const dot = s.ok ? c : "#ef4444";
     const n = cnt[s.name] || 0;
     const el = document.createElement("span");
-    el.className = "chip " + (on ? "on" : "off") + active;
-    el.innerHTML = `<span class="cbox" title="勾选 = 每次打开默认看这几位">${on?"✓":""}</span>`
+    el.className = "chip" + (chk ? " chk" : "") + (shown ? "" : " off") + active;
+    el.innerHTML = `<span class="cbox" title="勾上 = 每次打开网页默认看这几位（改完点右边「确定」）">${chk?"✓":""}</span>`
                  + `<span class="c-dot" style="background:${dot}"></span>`
-                 + `<span class="nm" title="点一下临时只看这一位（再点一次取消，不影响默认）">${esc(s.name)}</span>`
+                 + `<span class="nm" title="点一下切换显示 / 不显示（可多选，不会改默认）">${esc(s.name)}</span>`
                  + `<span class="cnt">${s.ok? n : "×"}</span>`;
     el.onclick = e=>{
-      // 前半截勾选框改「默认」，后半截名字是「临时只看这一位」，两个动作互不干扰
-      if(e.target.closest(".cbox")) toggleSource(s.name, el);
-      else toggleFocusSource(s.name);
+      // 点勾选框 = 改默认；点框框里的选手 = 切换此刻显示。两个动作分得很清。
+      if(e.target.closest(".cbox")) toggleDefault(s.name, el);
+      else toggleSource(s.name);
     };
     box.appendChild(el);
   });
-  // 选手后面跟一个「确定」：勾完点它，下次打开还是这几位
+  // 选手后面跟一个「确定」：这是「每次打开默认看哪几位」的开关
   const ok = document.createElement("button");
   ok.className = "pickok";
   ok.id = "pickOk";
@@ -295,15 +314,6 @@ function renderChips(sources){
 
 // 把字符串安全地放进 onclick 的单引号 JS 字符串里
 function jsArg(s){ return (s||"").replace(/\\/g,"\\\\").replace(/'/g,"\\'"); }
-
-// 临时只看某一位选手：不碰 localStorage，刷新就回到默认那几位。
-// 盘中最常用的是「切到某个人看看」，不是「改默认」——这两个动作必须分开。
-function toggleFocusSource(name){
-  if(focus && focus.kind==="source" && focus.value===name) focus = null;
-  else focus = {kind:"source", value:name};
-  if(lastData) renderChips(lastData.sources||[]);
-  renderPosts();
-}
 
 function setFocus(kind, value){
   focus = {kind, value};
@@ -320,13 +330,11 @@ function renderPosts(){
   const q = $("search").value.trim().toLowerCase();
   const feed = $("feed");
   if(!lastData){ feed.innerHTML = `<div class="empty">加载中…</div>`; return; }
-  // 临时「只看某一位选手」不受默认勾选限制 —— 否则点了没勾的那位会是一片空白
-  let posts;
-  if(focus && focus.kind==="source"){
-    posts = lastData.posts.filter(p=>p.source===focus.value);
-  }else{
-    posts = lastData.posts.filter(p=>isVisible(p.source));
-    if(focus) posts = posts.filter(p=>(p.speaker||"")===focus.value);
+  // 先按「当前显示」筛（色标开关），再叠加「只看某人」（点帖内标签/人名才有）
+  let posts = lastData.posts.filter(p=>isVisible(p.source));
+  if(focus){
+    if(focus.kind==="source") posts = posts.filter(p=>p.source===focus.value);
+    else posts = posts.filter(p=>(p.speaker||"")===focus.value);
   }
   const filtered = q
     ? posts.filter(p=>(p.text+" "+(p.speaker||"")).toLowerCase().includes(q))
@@ -340,7 +348,7 @@ function renderPosts(){
   }
   if(!filtered.length){
     const none = visible && visible.size === 0;
-    const msg = none ? "还没选选手 —— 勾上上方色标，再点「确定」"
+    const msg = none ? "一位选手都没显示 —— 点上方选手名字就能打开"
                      : (q ? "无匹配发言" : "当前窗口内没有发言");
     feed.innerHTML = bar + `<div class="empty">${msg}</div>`;
     $("total").textContent = "0";
