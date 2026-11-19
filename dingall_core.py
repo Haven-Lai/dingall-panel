@@ -33,6 +33,7 @@ SOURCES = [
     {"name": "龙头舵主", "url": "http://121.41.9.82:4380/dingall?a=%E9%BE%99%E5%A4%B4%E8%88%B5%E4%B8%BB%20&o=1&r=1"},
     {"name": "极致短线2", "url": "http://121.41.9.82:4380/dingall?a=%E6%9E%81%E8%87%B4%E7%9F%AD%E7%BA%BF2%20&o=1&r=1"},
     {"name": "极致短线",  "url": "http://121.41.9.82:4380/dingall?a=%E6%9E%81%E8%87%B4%E7%9F%AD%E7%BA%BF%20&o=1&r=1"},
+    {"name": "樱花哥",    "url": "http://121.41.9.82:4380/dingall?a=%E6%A8%B1%E8%8A%B1%E5%93%A5%20&o=1&r=1"},
     {"name": "金甲",      "url": "http://121.41.9.82:4380/dingall?a=%E9%87%91%E7%94%B2%20&o=1&r=1"},
 ]
 
@@ -42,11 +43,13 @@ OUTER_RE = re.compile(
     re.S,
 )
 # 内层：发言人 + 时间戳（同一行，可能带正文）
-# 两种日期写法都要吃下：
+# 三种写法都要吃下：
 #   - 自定义/极致短线类：`发言人 MM-DD HH:MM:SS`（无年份，靠外层头补）
 #   - 金牌竞价群：`哈尔滨恐龙380   2026-11-05 08:55:05`（带完整年份）
+#   - 樱花哥群：`太阳的微笑 11-19 09:53`（只有分钟、没有秒）
+# 秒必须做成可选：少了它，樱花哥那种分钟精度的来源会整源解析成无发言人。
 HEADER_RE = re.compile(
-    r'^(\S{1,24})\s+((?:\d{4}-)?\d{1,2}-\d{1,2} \d{1,2}:\d{2}:\d{2})\s*(.*)$'
+    r'^(\S{1,24})\s+((?:\d{4}-)?\d{1,2}-\d{1,2} \d{1,2}:\d{2}(?::\d{2})?)\s*(.*)$'
 )
 # 内联发言人：【名字】正文（同一行，用于提取名字；允许行首空格）
 INLINE_SPK_RE = re.compile(r'^\s*【\s*(.+?)\s*】\s*(.*)$')
@@ -57,7 +60,7 @@ INNER_TS_RE = re.compile(r'^\s*(\d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{2}:\d{2})\s*$')
 # 这些来源每条消息含两个时间戳：外层头（24 小时制，真实发帖时间）与
 # 内层（12 小时制，缺 AM/PM 标记，会比真实时间早 12 小时）。用户明确要求
 # 「按前面 24 小时制的时间来」，故这类来源一律采用外层（outer_time）。
-OUTER_TIME_SOURCES = {"金牌竞价", "龙头舵主", "灯神"}
+OUTER_TIME_SOURCES = {"金牌竞价", "龙头舵主", "灯神", "樱花哥"}
 # 仅剥离行首的【名字】前缀（不吞掉后续正文）
 STRIP_SPK_RE = re.compile(r'^\s*【\s*[^】]*\s*】\s*')
 # 纯发言人名（无标点、较短）
@@ -390,12 +393,13 @@ def clean_text(raw):
 
 
 def parse_ts_flex(s):
-    """解析可能不带前导零的日期时间，如 2026-8-21 12:14:46。"""
+    """解析可能不带前导零的日期时间，如 2026-8-21 12:14:46；秒可省略（樱花哥：09:53）。"""
     try:
-        m = re.match(r'(\d{4})-(\d{1,2})-(\d{1,2}) (\d{1,2}):(\d{2}):(\d{2})', s)
+        m = re.match(r'(\d{4})-(\d{1,2})-(\d{1,2}) (\d{1,2}):(\d{2})(?::(\d{2}))?', s)
         if not m:
             return 0.0
-        y, mo, d, h, mi, se = (int(x) for x in m.groups())
+        y, mo, d, h, mi = (int(m.group(k)) for k in range(1, 6))
+        se = int(m.group(6) or 0)
         return datetime.datetime(y, mo, d, h, mi, se).timestamp()
     except Exception:
         return 0.0
@@ -492,6 +496,9 @@ def parse_block(content, outer_time, source_name):
                 body = "\n".join(bl)
 
         speaker = speaker.strip().strip("【】").strip()
+        # 樱花哥群偶发把原消息连同括号一起转发（「（太阳的微笑 11-16 11:27」），
+        # 开头的括号是正文残留；不剥掉就会多出一个「（太阳的微笑」这样的假发言人。
+        speaker = re.sub(r'^[（(]+', '', speaker).strip()
         # 群标签类（灯神）：内联标签里塞的是「群名 · MM-DD HH:MM · 发言人」或「群名 · 发言人」，
         # 只认最后一段（那才是发言人的位置）。最后一段不是人名（如「∴」「10-21 09:58」）就留空，
         # 绝不回退去取前面的群名——否则「闲聊群」「系统复盘」会变成发言人，
@@ -506,6 +513,12 @@ def parse_block(content, outer_time, source_name):
         if source_name == "龙头舵主":
             speaker = "老师"
             body = re.sub(r'^\s*老师\s*[:：]?\s*', '', body)
+        # 樱花哥：单人大V频道，发言账号昵称恒为「太阳的微笑」。602 条里 560+ 条带
+        # 《太阳的微笑 MM-DD HH:MM》发言头，其余是纯图/网盘帖（压根没有发言头），
+        # 而「链接:」这类正文标签还会被 ROLE_RE 误认成一个人。统一强制成一个名字：
+        # 图片帖也能跟着人一起被筛出来，不会在「点名字只看某人」时莫名消失。
+        if source_name == "樱花哥":
+            speaker = "太阳的微笑"
         imgs = IMG_RE.findall(body)
         txt = clean_text(body)
         # 时间选取：
