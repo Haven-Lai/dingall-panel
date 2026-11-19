@@ -33,6 +33,10 @@
   .chip .cbox::after{content:"";position:absolute;inset:-7px -6px;}  /* 小方块太难点，热区放大 */
   .chip .nm{white-space:nowrap;}
   .chip .cnt{color:var(--muted);font-variant-numeric:tabular-nums;}
+  .pickmini{padding:4px 11px;border:1px solid var(--border);background:#fff;color:var(--muted);
+            border-radius:999px;cursor:pointer;font-size:12px;}
+  .pickmini:hover{border-color:#3b82f6;color:#3b82f6;background:#f8faff;}
+  .pickmini:first-of-type{margin-left:6px;}
   .pickok{padding:4px 16px;border:1px solid #3b82f6;background:#3b82f6;color:#fff;
           border-radius:999px;cursor:pointer;font-size:12px;font-weight:600;}
   .pickok:hover{filter:brightness(1.07);}
@@ -225,6 +229,17 @@ function toggleSource(name){
   renderPosts();
 }
 
+// 【全选 / 全不选】一把梭切换此刻显示哪几位。只动 visible，绝不碰默认（pending）。
+// 盘中想快速在「全都看」和「只看一两位」之间来回切，一个个点太磨人。
+function setAllVisible(on){
+  ensureVisible();
+  const srcs = (lastData && lastData.sources) || [];
+  visible = on ? new Set(srcs.map(s=>s.name)) : new Set();
+  focus = null;                  // 全开/全关之后不该还卡在「只看某人」
+  if(lastData) renderChips(srcs);
+  renderPosts();
+}
+
 // 【默认】点框框外面的勾选框：只改勾选状态，等用户点「确定」才落盘。
 function toggleDefault(name, el){
   ensureVisible();
@@ -302,6 +317,22 @@ function renderChips(sources){
     };
     box.appendChild(el);
   });
+  // 临时层的快捷按钮：只影响此刻显示，跟默认无关
+  const allOn = document.createElement("button");
+  allOn.className = "pickmini";
+  allOn.textContent = "全选";
+  allOn.title = "此刻全部显示（不改默认）";
+  allOn.onclick = ()=> setAllVisible(true);
+
+  const allOff = document.createElement("button");
+  allOff.className = "pickmini";
+  allOff.textContent = "全不选";
+  allOff.title = "此刻全部不显示（不改默认）";
+  allOff.onclick = ()=> setAllVisible(false);
+
+  box.appendChild(allOn);
+  box.appendChild(allOff);
+
   // 选手后面跟一个「确定」：这是「每次打开默认看哪几位」的开关
   const ok = document.createElement("button");
   ok.className = "pickok";
