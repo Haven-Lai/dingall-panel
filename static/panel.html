@@ -22,9 +22,18 @@
         border:1px solid var(--border);background:#fff;font-size:12px;cursor:pointer;user-select:none;
         transition:.15s;}
   .chip .c-dot{width:8px;height:8px;border-radius:50%;}
-  .chip.off{opacity:.45;filter:grayscale(1);}
+  .chip.off{opacity:.62;}
   .chip.off .c-dot{background:#c3c8d0 !important;}
+  .chip .cbox{width:14px;height:14px;flex:none;border:1.5px solid #cfd5dd;border-radius:4px;
+              background:#fff;display:inline-flex;align-items:center;justify-content:center;
+              font-size:10px;line-height:1;color:#fff;margin-right:-1px;}
+  .chip.on{border-color:#c7d2fe;}
+  .chip.on .cbox{background:#3b82f6;border-color:#3b82f6;}
   .chip .cnt{color:var(--muted);font-variant-numeric:tabular-nums;}
+  .pickok{padding:4px 16px;border:1px solid #3b82f6;background:#3b82f6;color:#fff;
+          border-radius:999px;cursor:pointer;font-size:12px;font-weight:600;}
+  .pickok:hover{filter:brightness(1.07);}
+  .pickok.done{background:#16a34a;border-color:#16a34a;}
   .ctrls{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap;}
   .ctrls input[type=text]{flex:1;min-width:180px;padding:7px 11px;border:1px solid var(--border);
         border-radius:8px;font-size:13px;outline:none;}
@@ -63,25 +72,6 @@
   .mini{padding:3px 10px;border:1px solid var(--border);background:#fff;border-radius:7px;
         cursor:pointer;font-size:12px;color:var(--text);}
   .mini:hover{border-color:#3b82f6;color:#3b82f6;}
-  #pickMask{position:fixed;inset:0;background:rgba(15,23,42,.42);z-index:60;display:none;
-            align-items:center;justify-content:center;padding:20px;}
-  #pickMask.show{display:flex;}
-  #pickBox{background:#fff;border-radius:14px;padding:20px 22px;width:min(560px,94vw);
-           max-height:86vh;overflow:auto;box-shadow:0 20px 50px rgba(0,0,0,.25);}
-  #pickBox h3{margin:0 0 6px;font-size:16px;}
-  #pickBox .hint{margin:0 0 14px;font-size:12px;color:var(--muted);line-height:1.6;}
-  .pickrow{display:flex;align-items:center;gap:10px;padding:9px 11px;border:1px solid var(--border);
-           border-radius:10px;margin-bottom:8px;cursor:pointer;transition:.12s;}
-  .pickrow:hover{border-color:#c7d2fe;background:#f8faff;}
-  .pickrow.on{border-color:#3b82f6;background:#eef2ff;}
-  .pickrow .box{width:16px;height:16px;border:1.5px solid #cfd5dd;border-radius:4px;flex:none;
-                display:flex;align-items:center;justify-content:center;font-size:11px;color:#fff;}
-  .pickrow.on .box{background:#3b82f6;border-color:#3b82f6;}
-  .pickrow .c-dot{width:10px;height:10px;border-radius:50%;flex:none;}
-  .pickrow .nm{font-weight:600;}
-  .pickrow .cnt{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums;}
-  .pickActions{display:flex;gap:10px;margin-top:14px;}
-  .pickActions .grow{flex:1;}
   .topnav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:16px;
          background:rgba(255,255,255,.95);backdrop-filter:blur(8px);border-bottom:1px solid var(--border);
          padding:10px 18px;}
@@ -118,9 +108,6 @@
   <div class="chips" id="chips"></div>
   <div class="picksum" id="picksum">
     <span id="pickInfo">—</span>
-    <button class="mini" onclick="selectAllSources()">全选</button>
-    <button class="mini" onclick="clearAllSources()">清空</button>
-    <button class="mini" onclick="openPicker()">选择选手…</button>
   </div>
   <div class="ctrls">
     <select id="win" class="btn" title="时间范围">
@@ -142,20 +129,6 @@
 <section id="view-lianban" style="display:none">
   <iframe src="/lianban" title="连板复盘" allow="fullscreen"></iframe>
 </section>
-
-<div id="pickMask">
-  <div id="pickBox">
-    <h3>选择要看的选手</h3>
-    <p class="hint">勾选后自动记住，以后每次打开都只看这几位。随时点上方色标也能开关。</p>
-    <div id="pickList"></div>
-    <div class="pickActions">
-      <button class="mini" onclick="selectAllSources(true)">全选</button>
-      <button class="mini" onclick="clearAllSources(true)">清空</button>
-      <span class="grow"></span>
-      <button class="btn primary" onclick="closePicker()">确定</button>
-    </div>
-  </div>
-</div>
 
 <script>
 const REFRESH_MS = 5000;
@@ -180,16 +153,16 @@ const $ = id => document.getElementById(id);
 
 function esc(s){return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
 
-// ===== 默认只看选中的选手 =====
-// 7 个选手全铺开没法看，所以选择要记在本地：勾一次，以后每次打开都按它来。
+// ===== 选手筛选：色标前的勾选框 =====
+// 7 个选手全铺开没法看。每颗色标前面一个勾选框，勾完点后面的「确定」记住，
+// 以后每次打开就只看这几位。勾选即时生效（所见即所得），同时写本地，不会因为
+// 忘了点确定就白选——「确定」负责收工反馈，以及「一个都没勾」时兜底成全选。
 // 存 {"visible":[...], "seen":[...]}：seen 是上次保存时已知的全部源名，
 // 用来识别「后来新加的选手」——没见过的源默认给看，绝不因为一次旧选择就把新选手漏掉。
 const VIS_KEY = "dingall_visible_sources_v1";
-let visible = null;        // Set<源名>；null = 还没有本地记录（首次打开，弹选择面板）
+let visible = null;        // Set<源名>；null = 还没有本地记录（首次打开）
 let seenSources = [];      // 上次保存时已知的源名
-let pickerShown = false;   // 首次面板只弹一次，别被 SSE 的多次回调弹成复读机
-let firstPick = false;     // 本次面板是首次使用的引导（决定关面板时要不要兜底成全选）
-let hasSaved = false;      // 本地是否存过选择记录（没有 = 第一次用，要引导）
+let hasSaved = false;      // 本地是否存过选择记录
 
 function loadVisible(){
   try{
@@ -213,15 +186,14 @@ function saveVisible(){
 function isVisible(name){ return !visible || visible.has(name); }
 
 function ensureVisible(){
-  if(visible) return;
   // 首次使用：从「一个都不勾」开始，让用户自己挑要看的几位。
   // 别默认全勾——那等于让用户去点掉 5 个不要的，跟「太多选手了」的诉求正好相反。
-  visible = new Set();
+  if(!visible) visible = new Set();
 }
 
 // 新源（不在上次 seen 里）自动并入可见：宁可多显示一个，也别让人以为那源没数据
 // ⚠️ 只在「用户以前存过选择」时做。首次使用时 seenSources 是空的，
-//    不加 hasSaved 判断的话会把 7 个源全当成新源塞进空集合，等于又默认全选了。
+//    不加 hasSaved 判断的话会把全部源都当成新源塞进空集合，等于又默认全选了。
 function syncNewSources(sources){
   if(!sources || !sources.length) return false;
   let changed = false;
@@ -235,73 +207,42 @@ function syncNewSources(sources){
   return changed;
 }
 
-function toggleSource(name, fromPicker){
+// 点勾选框：只改这一颗的样式，不重绘整排，免得点一下色标全跳一下
+function toggleSource(name, el){
   ensureVisible();
-  if(visible.has(name)) visible.delete(name); else visible.add(name);
-  saveVisible();
-  if(lastData) renderChips(lastData.sources||[]);
-  if(fromPicker) renderPicker();
-  renderPosts();
-}
-
-function selectAllSources(keepOpen){
-  visible = new Set(((lastData && lastData.sources) || []).map(s=>s.name));
-  saveVisible();
-  if(lastData) renderChips(lastData.sources||[]);
-  if(keepOpen) renderPicker(); else closePicker();
-  renderPosts();
-}
-
-// 面板外的「清空」是明确操作，允许真清空；首次引导面板里清空则兜底成全选（见 closePicker）
-function clearAllSources(keepOpen){
-  ensureVisible();
-  visible = new Set();
-  saveVisible();
-  if(lastData) renderChips(lastData.sources||[]);
-  if(keepOpen) renderPicker();
-  renderPosts();
-}
-
-function openPicker(){
-  ensureVisible();
-  renderPicker();
-  $("pickMask").classList.add("show");
-}
-
-function closePicker(){
-  // 首次进来还没做过选择时别给人一片空白：一个都没勾就按全选处理。
-  // 已经用过的人主动清空是明确表达，尊重它（列表区会给出引导文案）。
-  if(firstPick && visible && visible.size === 0){
-    const all = ((lastData && lastData.sources) || []).map(s=>s.name);
-    if(all.length){ visible = new Set(all); saveVisible(); }
+  const on = !visible.has(name);
+  if(on) visible.add(name); else visible.delete(name);
+  saveVisible(); hasSaved = true;
+  if(el){
+    el.classList.toggle("on", on);
+    el.classList.toggle("off", !on);
+    const b = el.querySelector(".cbox");
+    if(b) b.textContent = on ? "✓" : "";
   }
-  firstPick = false;
-  $("pickMask").classList.remove("show");
-  if(lastData) renderChips(lastData.sources||[]);
+  updPickSum();
   renderPosts();
 }
 
-let pickSig = "";          // 面板内容指纹：数据没变就不重绘，免得点的时候闪
-function renderPicker(){
-  const srcs = (lastData && lastData.sources) || [];
-  const cnt = {};
-  ((lastData && lastData.posts) || []).forEach(p=>{ cnt[p.source]=(cnt[p.source]||0)+1; });
-  const box = $("pickList");
-  if(!srcs.length){ box.innerHTML = `<div class="hint">选手列表还在加载…</div>`; return; }
-  const sig = srcs.map(s=>s.name+":"+(cnt[s.name]||0)).join("|")
-            + "#" + (visible ? [...visible].join(",") : "");
-  if(sig === pickSig) return;
-  pickSig = sig;
-  box.innerHTML = srcs.map(s=>{
-    const c = COLORS[s.name] || "#888";
-    const on = isVisible(s.name);
-    return `<div class="pickrow${on?" on":""}" onclick="toggleSource('${jsArg(s.name)}', true)">
-      <span class="box">${on?"✓":""}</span>
-      <span class="c-dot" style="background:${c}"></span>
-      <span class="nm">${esc(s.name)}</span>
-      <span class="cnt">${cnt[s.name]||0} 条</span>
-    </div>`;
-  }).join("");
+function confirmPick(){
+  ensureVisible();
+  // 一个都没勾就点确定 -> 兜底成全选。宁可全给你看，也别留一片空白让人以为看板挂了。
+  if(visible.size === 0){
+    const all = ((lastData && lastData.sources) || []).map(s=>s.name);
+    if(all.length){
+      visible = new Set(all); saveVisible(); hasSaved = true;
+      if(lastData) renderChips(lastData.sources||[]);
+      renderPosts();
+    }
+  }else{
+    saveVisible(); hasSaved = true;
+  }
+  const btn = $("pickOk");
+  if(btn){
+    btn.classList.add("done");
+    btn.textContent = "✓ 已记住";
+    setTimeout(()=>{ btn.classList.remove("done"); btn.textContent = "确定"; }, 1400);
+  }
+  updPickSum();
 }
 
 function updPickSum(){
@@ -310,16 +251,7 @@ function updPickSum(){
   const n = srcs.filter(s=>isVisible(s.name)).length;
   $("pickInfo").innerHTML = n
     ? `只看 <b>${n}</b>/${srcs.length} 位选手`
-    : `<span style="color:#f59e0b">一位选手都没选，点上方色标或「选择选手…」</span>`;
-}
-
-// 首次打开（本地没有记录）弹一次选择面板
-function maybeOpenPicker(){
-  if(hasSaved || pickerShown) return;
-  if(!lastData || !(lastData.sources||[]).length) return;
-  pickerShown = true;
-  firstPick = true;
-  openPicker();
+    : `<span style="color:#f59e0b">一位都没选 —— 勾上要看的选手，再点「确定」</span>`;
 }
 
 function renderChips(sources){
@@ -336,13 +268,21 @@ function renderChips(sources){
     const dot = s.ok ? c : "#ef4444";
     const n = cnt[s.name] || 0;
     const el = document.createElement("span");
-    el.className = "chip" + (on ? "" : " off") + active;
-    el.title = (on ? "点击隐藏「" : "点击显示「") + s.name + "」（可多选，自动记住）";
-    el.innerHTML = `<span class="c-dot" style="background:${dot}"></span>${esc(s.name)}`
+    el.className = "chip " + (on ? "on" : "off") + active;
+    el.title = "勾上就只看这几位（勾完点右侧「确定」记住）";
+    el.innerHTML = `<span class="cbox">${on?"✓":""}</span>`
+                 + `<span class="c-dot" style="background:${dot}"></span>${esc(s.name)}`
                  + `<span class="cnt">${s.ok? n : "×"}</span>`;
-    el.onclick = ()=> toggleSource(s.name);
+    el.onclick = ()=> toggleSource(s.name, el);
     box.appendChild(el);
   });
+  // 选手后面跟一个「确定」：勾完点它，下次打开还是这几位
+  const ok = document.createElement("button");
+  ok.className = "pickok";
+  ok.id = "pickOk";
+  ok.textContent = "确定";
+  ok.onclick = confirmPick;
+  box.appendChild(ok);
   updPickSum();
 }
 
@@ -381,7 +321,7 @@ function renderPosts(){
   }
   if(!filtered.length){
     const none = visible && visible.size === 0;
-    const msg = none ? "一位选手都没选，点上方色标或「选择选手…」"
+    const msg = none ? "还没选选手 —— 勾上上方色标，再点「确定」"
                      : (q ? "无匹配发言" : "当前窗口内没有发言");
     feed.innerHTML = bar + `<div class="empty">${msg}</div>`;
     $("total").textContent = "0";
@@ -446,8 +386,6 @@ async function load(){
     updStatus(d.sources || []);
     renderChips(d.sources||[]);
     renderPosts();
-    maybeOpenPicker();
-    if($("pickMask").classList.contains("show")) renderPicker();   // 面板开着时选手列表变了要跟着刷
     if(d.posts && d.posts.length){
       prevMaxTs = d.posts[0].ts;   // 已按时间倒序，首条即最新
     }
@@ -471,7 +409,6 @@ function paintFromCache(){
     $("updated").textContent = (c.updated || "--") + "（缓存）";
     renderChips(c.sources||[]);
     renderPosts();
-    maybeOpenPicker();
     return true;
   }catch(e){ return false; }
 }
@@ -600,8 +537,6 @@ $("pauseBtn").onclick = ()=>{
   $("pauseBtn").classList.toggle("primary", paused);
 };
 $("search").addEventListener("input", renderPosts);
-// 点面板外的空白处也能关（等同「确定」，改动都是即时生效的）
-$("pickMask").addEventListener("click", e=>{ if(e.target === $("pickMask")) closePicker(); });
 
 const VIEWS = ['feed','sentiment','lianban'];
 document.querySelectorAll('button.tab').forEach(b=>{
@@ -621,8 +556,8 @@ document.querySelectorAll('button.tab').forEach(b=>{
   };
 });
 
-loadVisible();          // 先读本地选择，首屏 chips 就是筛过的状态
-ensureVisible();        // 没存过记录的，先按「一位都没选」渲染，等引导面板
+loadVisible();          // 先读本地选择，首屏色标就是勾好的状态
+ensureVisible();        // 没存过记录的，先按「一位都没勾」渲染，等他自己挑
 paintFromCache();
 load();
 startTimers();
