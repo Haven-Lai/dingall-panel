@@ -29,6 +29,9 @@
               font-size:10px;line-height:1;color:#fff;margin-right:-1px;}
   .chip.on{border-color:#c7d2fe;}
   .chip.on .cbox{background:#3b82f6;border-color:#3b82f6;}
+  .chip .cbox{position:relative;}
+  .chip .cbox::after{content:"";position:absolute;inset:-7px -6px;}  /* 小方块太难点，热区放大 */
+  .chip .nm{white-space:nowrap;}
   .chip .cnt{color:var(--muted);font-variant-numeric:tabular-nums;}
   .pickok{padding:4px 16px;border:1px solid #3b82f6;background:#3b82f6;color:#fff;
           border-radius:999px;cursor:pointer;font-size:12px;font-weight:600;}
@@ -250,8 +253,8 @@ function updPickSum(){
   if(!srcs.length) return;
   const n = srcs.filter(s=>isVisible(s.name)).length;
   $("pickInfo").innerHTML = n
-    ? `只看 <b>${n}</b>/${srcs.length} 位选手`
-    : `<span style="color:#f59e0b">一位都没选 —— 勾上要看的选手，再点「确定」</span>`;
+    ? `默认只看 <b>${n}</b>/${srcs.length} 位 · 点选手名字可临时只看一位`
+    : `<span style="color:#f59e0b">一位都没勾 —— 勾上要看的选手，再点「确定」</span>`;
 }
 
 function renderChips(sources){
@@ -269,11 +272,15 @@ function renderChips(sources){
     const n = cnt[s.name] || 0;
     const el = document.createElement("span");
     el.className = "chip " + (on ? "on" : "off") + active;
-    el.title = "勾上就只看这几位（勾完点右侧「确定」记住）";
-    el.innerHTML = `<span class="cbox">${on?"✓":""}</span>`
-                 + `<span class="c-dot" style="background:${dot}"></span>${esc(s.name)}`
+    el.innerHTML = `<span class="cbox" title="勾选 = 每次打开默认看这几位">${on?"✓":""}</span>`
+                 + `<span class="c-dot" style="background:${dot}"></span>`
+                 + `<span class="nm" title="点一下临时只看这一位（再点一次取消，不影响默认）">${esc(s.name)}</span>`
                  + `<span class="cnt">${s.ok? n : "×"}</span>`;
-    el.onclick = ()=> toggleSource(s.name, el);
+    el.onclick = e=>{
+      // 前半截勾选框改「默认」，后半截名字是「临时只看这一位」，两个动作互不干扰
+      if(e.target.closest(".cbox")) toggleSource(s.name, el);
+      else toggleFocusSource(s.name);
+    };
     box.appendChild(el);
   });
   // 选手后面跟一个「确定」：勾完点它，下次打开还是这几位
@@ -288,6 +295,15 @@ function renderChips(sources){
 
 // 把字符串安全地放进 onclick 的单引号 JS 字符串里
 function jsArg(s){ return (s||"").replace(/\\/g,"\\\\").replace(/'/g,"\\'"); }
+
+// 临时只看某一位选手：不碰 localStorage，刷新就回到默认那几位。
+// 盘中最常用的是「切到某个人看看」，不是「改默认」——这两个动作必须分开。
+function toggleFocusSource(name){
+  if(focus && focus.kind==="source" && focus.value===name) focus = null;
+  else focus = {kind:"source", value:name};
+  if(lastData) renderChips(lastData.sources||[]);
+  renderPosts();
+}
 
 function setFocus(kind, value){
   focus = {kind, value};
@@ -304,10 +320,13 @@ function renderPosts(){
   const q = $("search").value.trim().toLowerCase();
   const feed = $("feed");
   if(!lastData){ feed.innerHTML = `<div class="empty">加载中…</div>`; return; }
-  let posts = lastData.posts.filter(p=>isVisible(p.source));
-  if(focus){
-    if(focus.kind==="source") posts = posts.filter(p=>p.source===focus.value);
-    else posts = posts.filter(p=>(p.speaker||"")===focus.value);
+  // 临时「只看某一位选手」不受默认勾选限制 —— 否则点了没勾的那位会是一片空白
+  let posts;
+  if(focus && focus.kind==="source"){
+    posts = lastData.posts.filter(p=>p.source===focus.value);
+  }else{
+    posts = lastData.posts.filter(p=>isVisible(p.source));
+    if(focus) posts = posts.filter(p=>(p.speaker||"")===focus.value);
   }
   const filtered = q
     ? posts.filter(p=>(p.text+" "+(p.speaker||"")).toLowerCase().includes(q))
