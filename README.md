@@ -261,6 +261,17 @@ print(r['count'], c.most_common(8))
 健康标准：**每个源都有若干非空发言人**。某个源全是空字符串 = 解析坏了。
 
 ```bash
+# 1.5) 动了通用解析逻辑（HEADER_RE / clean_text / ROLE_RE 之类）必须做回归：
+python tests/parse_regress.py save     # 先抓一份原始 HTML 存缓存 + 记录解析指纹
+# ...改 dingall_core.py...
+python tests/parse_regress.py check    # 用同一份缓存重跑，逐源对比 md5
+```
+
+两次解析跑在**同一份字节**上才有意义——直接对比线上内容永远不一致，因为上游每次都有新帖。
+`HEADER_RE` 放开一点（比如允许时间戳没有秒）看着无害，但它是所有源共用的，
+改完一定要确认原有源全部「一致」，新源只是「新增」。
+
+```bash
 # 2) 本地起服务，看全链路
 PORT=18899 python app.py
 curl -s --noproxy '*' "http://127.0.0.1:18899/api/feed?hours=24" | python -m json.tool | head -40
