@@ -22,7 +22,8 @@
         border:1px solid var(--border);background:#fff;font-size:12px;cursor:pointer;user-select:none;
         transition:.15s;}
   .chip .c-dot{width:8px;height:8px;border-radius:50%;}
-  .chip.off{opacity:.4;text-decoration:line-through;}
+  .chip.off{opacity:.45;filter:grayscale(1);}
+  .chip.off .c-dot{background:#c3c8d0 !important;}
   .chip .cnt{color:var(--muted);font-variant-numeric:tabular-nums;}
   .ctrls{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap;}
   .ctrls input[type=text]{flex:1;min-width:180px;padding:7px 11px;border:1px solid var(--border);
@@ -56,6 +57,31 @@
             display:flex;align-items:center;gap:10px;font-size:13px;}
   .focusbar .x{cursor:pointer;margin-left:auto;background:#3b82f6;color:#fff;border-radius:6px;
               padding:3px 10px;font-size:12px;}
+  /* ===== 默认只看选中的选手 ===== */
+  .picksum{display:flex;align-items:center;gap:10px;margin-top:8px;font-size:12px;
+           color:var(--muted);flex-wrap:wrap;}
+  .mini{padding:3px 10px;border:1px solid var(--border);background:#fff;border-radius:7px;
+        cursor:pointer;font-size:12px;color:var(--text);}
+  .mini:hover{border-color:#3b82f6;color:#3b82f6;}
+  #pickMask{position:fixed;inset:0;background:rgba(15,23,42,.42);z-index:60;display:none;
+            align-items:center;justify-content:center;padding:20px;}
+  #pickMask.show{display:flex;}
+  #pickBox{background:#fff;border-radius:14px;padding:20px 22px;width:min(560px,94vw);
+           max-height:86vh;overflow:auto;box-shadow:0 20px 50px rgba(0,0,0,.25);}
+  #pickBox h3{margin:0 0 6px;font-size:16px;}
+  #pickBox .hint{margin:0 0 14px;font-size:12px;color:var(--muted);line-height:1.6;}
+  .pickrow{display:flex;align-items:center;gap:10px;padding:9px 11px;border:1px solid var(--border);
+           border-radius:10px;margin-bottom:8px;cursor:pointer;transition:.12s;}
+  .pickrow:hover{border-color:#c7d2fe;background:#f8faff;}
+  .pickrow.on{border-color:#3b82f6;background:#eef2ff;}
+  .pickrow .box{width:16px;height:16px;border:1.5px solid #cfd5dd;border-radius:4px;flex:none;
+                display:flex;align-items:center;justify-content:center;font-size:11px;color:#fff;}
+  .pickrow.on .box{background:#3b82f6;border-color:#3b82f6;}
+  .pickrow .c-dot{width:10px;height:10px;border-radius:50%;flex:none;}
+  .pickrow .nm{font-weight:600;}
+  .pickrow .cnt{color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums;}
+  .pickActions{display:flex;gap:10px;margin-top:14px;}
+  .pickActions .grow{flex:1;}
   .topnav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:16px;
          background:rgba(255,255,255,.95);backdrop-filter:blur(8px);border-bottom:1px solid var(--border);
          padding:10px 18px;}
@@ -85,11 +111,17 @@
   <div class="title"><span class="dot" id="liveDot"></span>大V发言整合看板</div>
   <div class="sub">
     <span>更新于：<b id="updated">--</b></span>
-    <span>共 <b id="total">0</b> 条</span>
+    <span>显示 <b id="total">0</b> 条</span>
     <span>下次刷新 <span class="countdown" id="cd">5</span>s</span>
     <span id="statusLine"></span>
   </div>
   <div class="chips" id="chips"></div>
+  <div class="picksum" id="picksum">
+    <span id="pickInfo">—</span>
+    <button class="mini" onclick="selectAllSources()">全选</button>
+    <button class="mini" onclick="clearAllSources()">清空</button>
+    <button class="mini" onclick="openPicker()">选择选手…</button>
+  </div>
   <div class="ctrls">
     <select id="win" class="btn" title="时间范围">
       <option value="1">最近 1 小时</option>
@@ -110,6 +142,20 @@
 <section id="view-lianban" style="display:none">
   <iframe src="/lianban" title="连板复盘" allow="fullscreen"></iframe>
 </section>
+
+<div id="pickMask">
+  <div id="pickBox">
+    <h3>选择要看的选手</h3>
+    <p class="hint">勾选后自动记住，以后每次打开都只看这几位。随时点上方色标也能开关。</p>
+    <div id="pickList"></div>
+    <div class="pickActions">
+      <button class="mini" onclick="selectAllSources(true)">全选</button>
+      <button class="mini" onclick="clearAllSources(true)">清空</button>
+      <span class="grow"></span>
+      <button class="btn primary" onclick="closePicker()">确定</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const REFRESH_MS = 5000;
@@ -134,7 +180,145 @@ const $ = id => document.getElementById(id);
 
 function esc(s){return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
 
+// ===== 默认只看选中的选手 =====
+// 7 个选手全铺开没法看，所以选择要记在本地：勾一次，以后每次打开都按它来。
+// 存 {"visible":[...], "seen":[...]}：seen 是上次保存时已知的全部源名，
+// 用来识别「后来新加的选手」——没见过的源默认给看，绝不因为一次旧选择就把新选手漏掉。
+const VIS_KEY = "dingall_visible_sources_v1";
+let visible = null;        // Set<源名>；null = 还没有本地记录（首次打开，弹选择面板）
+let seenSources = [];      // 上次保存时已知的源名
+let pickerShown = false;   // 首次面板只弹一次，别被 SSE 的多次回调弹成复读机
+let firstPick = false;     // 本次面板是首次使用的引导（决定关面板时要不要兜底成全选）
+
+function loadVisible(){
+  try{
+    const raw = localStorage.getItem(VIS_KEY);
+    if(!raw) return;
+    const o = JSON.parse(raw);
+    if(!o || !Array.isArray(o.visible)) return;
+    visible = new Set(o.visible);
+    seenSources = Array.isArray(o.seen) ? o.seen : [];
+  }catch(e){}
+}
+
+function saveVisible(){
+  if(!visible) return;
+  try{
+    localStorage.setItem(VIS_KEY, JSON.stringify({visible:[...visible], seen:seenSources}));
+  }catch(e){}
+}
+
+function isVisible(name){ return !visible || visible.has(name); }
+
+function ensureVisible(){
+  if(visible) return;
+  const srcs = (lastData && lastData.sources) || [];
+  visible = new Set(srcs.map(s=>s.name));
+}
+
+// 新源（不在上次 seen 里）自动并入可见：宁可多显示一个，也别让人以为那源没数据
+function syncNewSources(sources){
+  if(!sources || !sources.length) return false;
+  let changed = false;
+  if(visible){
+    sources.forEach(s=>{
+      if(!seenSources.includes(s.name) && !visible.has(s.name)){ visible.add(s.name); changed = true; }
+    });
+  }
+  seenSources = sources.map(s=>s.name);
+  if(changed) saveVisible();
+  return changed;
+}
+
+function toggleSource(name, fromPicker){
+  ensureVisible();
+  if(visible.has(name)) visible.delete(name); else visible.add(name);
+  saveVisible();
+  if(lastData) renderChips(lastData.sources||[]);
+  if(fromPicker) renderPicker();
+  renderPosts();
+}
+
+function selectAllSources(keepOpen){
+  visible = new Set(((lastData && lastData.sources) || []).map(s=>s.name));
+  saveVisible();
+  if(lastData) renderChips(lastData.sources||[]);
+  if(keepOpen) renderPicker(); else closePicker();
+  renderPosts();
+}
+
+// 面板外的「清空」是明确操作，允许真清空；首次引导面板里清空则兜底成全选（见 closePicker）
+function clearAllSources(keepOpen){
+  ensureVisible();
+  visible = new Set();
+  saveVisible();
+  if(lastData) renderChips(lastData.sources||[]);
+  if(keepOpen) renderPicker();
+  renderPosts();
+}
+
+function openPicker(){
+  ensureVisible();
+  renderPicker();
+  $("pickMask").classList.add("show");
+}
+
+function closePicker(){
+  // 首次进来还没做过选择时别给人一片空白：一个都没勾就按全选处理。
+  // 已经用过的人主动清空是明确表达，尊重它（列表区会给出引导文案）。
+  if(firstPick && visible && visible.size === 0){
+    const all = ((lastData && lastData.sources) || []).map(s=>s.name);
+    if(all.length){ visible = new Set(all); saveVisible(); }
+  }
+  firstPick = false;
+  $("pickMask").classList.remove("show");
+  if(lastData) renderChips(lastData.sources||[]);
+  renderPosts();
+}
+
+let pickSig = "";          // 面板内容指纹：数据没变就不重绘，免得点的时候闪
+function renderPicker(){
+  const srcs = (lastData && lastData.sources) || [];
+  const cnt = {};
+  ((lastData && lastData.posts) || []).forEach(p=>{ cnt[p.source]=(cnt[p.source]||0)+1; });
+  const box = $("pickList");
+  if(!srcs.length){ box.innerHTML = `<div class="hint">选手列表还在加载…</div>`; return; }
+  const sig = srcs.map(s=>s.name+":"+(cnt[s.name]||0)).join("|")
+            + "#" + (visible ? [...visible].join(",") : "");
+  if(sig === pickSig) return;
+  pickSig = sig;
+  box.innerHTML = srcs.map(s=>{
+    const c = COLORS[s.name] || "#888";
+    const on = isVisible(s.name);
+    return `<div class="pickrow${on?" on":""}" onclick="toggleSource('${jsArg(s.name)}', true)">
+      <span class="box">${on?"✓":""}</span>
+      <span class="c-dot" style="background:${c}"></span>
+      <span class="nm">${esc(s.name)}</span>
+      <span class="cnt">${cnt[s.name]||0} 条</span>
+    </div>`;
+  }).join("");
+}
+
+function updPickSum(){
+  const srcs = (lastData && lastData.sources) || [];
+  if(!srcs.length) return;
+  const n = srcs.filter(s=>isVisible(s.name)).length;
+  $("pickInfo").innerHTML = n
+    ? `只看 <b>${n}</b>/${srcs.length} 位选手`
+    : `<span style="color:#f59e0b">一位选手都没选，点上方色标或「选择选手…」</span>`;
+}
+
+// 首次打开（本地没有记录）弹一次选择面板
+function maybeOpenPicker(){
+  if(visible || pickerShown) return;
+  if(!lastData || !(lastData.sources||[]).length) return;
+  pickerShown = true;
+  firstPick = true;
+  openPicker();
+}
+
 function renderChips(sources){
+  syncNewSources(sources);
   // 窗口内各来源条数（从当前 posts 统计）
   const cnt = {};
   (lastData ? lastData.posts : []).forEach(p=>{ cnt[p.source]=(cnt[p.source]||0)+1; });
@@ -142,21 +326,19 @@ function renderChips(sources){
   box.innerHTML = "";
   sources.forEach(s=>{
     const c = COLORS[s.name] || "#888";
+    const on = isVisible(s.name);
     const active = (focus && focus.kind==="source" && focus.value===s.name) ? " active" : "";
     const dot = s.ok ? c : "#ef4444";
     const n = cnt[s.name] || 0;
     const el = document.createElement("span");
-    el.className = "chip"+active;
-    el.title = "点击只看「"+s.name+"」一个人";
+    el.className = "chip" + (on ? "" : " off") + active;
+    el.title = (on ? "点击隐藏「" : "点击显示「") + s.name + "」（可多选，自动记住）";
     el.innerHTML = `<span class="c-dot" style="background:${dot}"></span>${esc(s.name)}`
                  + `<span class="cnt">${s.ok? n : "×"}</span>`;
-    el.onclick = ()=>{
-      if(focus && focus.kind==="source" && focus.value===s.name){ focus = null; }
-      else { focus = {kind:"source", value:s.name}; }
-      renderChips(sources); renderPosts();
-    };
+    el.onclick = ()=> toggleSource(s.name);
     box.appendChild(el);
   });
+  updPickSum();
 }
 
 // 把字符串安全地放进 onclick 的单引号 JS 字符串里
@@ -177,7 +359,7 @@ function renderPosts(){
   const q = $("search").value.trim().toLowerCase();
   const feed = $("feed");
   if(!lastData){ feed.innerHTML = `<div class="empty">加载中…</div>`; return; }
-  let posts = lastData.posts;
+  let posts = lastData.posts.filter(p=>isVisible(p.source));
   if(focus){
     if(focus.kind==="source") posts = posts.filter(p=>p.source===focus.value);
     else posts = posts.filter(p=>(p.speaker||"")===focus.value);
@@ -193,9 +375,14 @@ function renderPosts(){
         + `<span class="x" onclick="clearFocus()">✕ 显示全部</span></div>`;
   }
   if(!filtered.length){
-    feed.innerHTML = bar + `<div class="empty">${q?"无匹配发言":"暂无发言数据"}</div>`;
+    const none = visible && visible.size === 0;
+    const msg = none ? "一位选手都没选，点上方色标或「选择选手…」"
+                     : (q ? "无匹配发言" : "当前窗口内没有发言");
+    feed.innerHTML = bar + `<div class="empty">${msg}</div>`;
+    $("total").textContent = "0";
     return;
   }
+  $("total").textContent = filtered.length;
   feed.innerHTML = bar + filtered.map(p=>{
     const c = COLORS[p.source] || "#888";
     const spk = p.speaker
@@ -251,10 +438,11 @@ async function load(){
     dataFresh = true;
     lastFullSync = Date.now();
     $("updated").textContent = d.updated || "--";
-    $("total").textContent = d.total || 0;
     updStatus(d.sources || []);
     renderChips(d.sources||[]);
     renderPosts();
+    maybeOpenPicker();
+    if($("pickMask").classList.contains("show")) renderPicker();   // 面板开着时选手列表变了要跟着刷
     if(d.posts && d.posts.length){
       prevMaxTs = d.posts[0].ts;   // 已按时间倒序，首条即最新
     }
@@ -276,9 +464,9 @@ function paintFromCache(){
     lastData = c;
     dataFresh = false;      // 缓存不是全量最新，别拿它当增量基准
     $("updated").textContent = (c.updated || "--") + "（缓存）";
-    $("total").textContent = c.total || 0;
     renderChips(c.sources||[]);
     renderPosts();
+    maybeOpenPicker();
     return true;
   }catch(e){ return false; }
 }
@@ -334,7 +522,6 @@ function applyDelta(m){
     }
     prevMaxTs = oldMax;                            // 用旧基准判断谁是「新发言」以高亮
     $("updated").textContent = lastData.updated || "--";
-    $("total").textContent = lastData.total;
     renderPosts();
     prevMaxTs = lastData.posts[0].ts;
     saveCache(lastData);
@@ -408,6 +595,8 @@ $("pauseBtn").onclick = ()=>{
   $("pauseBtn").classList.toggle("primary", paused);
 };
 $("search").addEventListener("input", renderPosts);
+// 点面板外的空白处也能关（等同「确定」，改动都是即时生效的）
+$("pickMask").addEventListener("click", e=>{ if(e.target === $("pickMask")) closePicker(); });
 
 const VIEWS = ['feed','sentiment','lianban'];
 document.querySelectorAll('button.tab').forEach(b=>{
@@ -427,6 +616,7 @@ document.querySelectorAll('button.tab').forEach(b=>{
   };
 });
 
+loadVisible();          // 先读本地选择，首屏 chips 就是筛过的状态
 paintFromCache();
 load();
 startTimers();
