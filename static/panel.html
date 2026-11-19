@@ -189,6 +189,7 @@ let visible = null;        // Set<源名>；null = 还没有本地记录（首�
 let seenSources = [];      // 上次保存时已知的源名
 let pickerShown = false;   // 首次面板只弹一次，别被 SSE 的多次回调弹成复读机
 let firstPick = false;     // 本次面板是首次使用的引导（决定关面板时要不要兜底成全选）
+let hasSaved = false;      // 本地是否存过选择记录（没有 = 第一次用，要引导）
 
 function loadVisible(){
   try{
@@ -198,6 +199,7 @@ function loadVisible(){
     if(!o || !Array.isArray(o.visible)) return;
     visible = new Set(o.visible);
     seenSources = Array.isArray(o.seen) ? o.seen : [];
+    hasSaved = true;
   }catch(e){}
 }
 
@@ -212,15 +214,18 @@ function isVisible(name){ return !visible || visible.has(name); }
 
 function ensureVisible(){
   if(visible) return;
-  const srcs = (lastData && lastData.sources) || [];
-  visible = new Set(srcs.map(s=>s.name));
+  // 首次使用：从「一个都不勾」开始，让用户自己挑要看的几位。
+  // 别默认全勾——那等于让用户去点掉 5 个不要的，跟「太多选手了」的诉求正好相反。
+  visible = new Set();
 }
 
 // 新源（不在上次 seen 里）自动并入可见：宁可多显示一个，也别让人以为那源没数据
+// ⚠️ 只在「用户以前存过选择」时做。首次使用时 seenSources 是空的，
+//    不加 hasSaved 判断的话会把 7 个源全当成新源塞进空集合，等于又默认全选了。
 function syncNewSources(sources){
   if(!sources || !sources.length) return false;
   let changed = false;
-  if(visible){
+  if(hasSaved && visible){
     sources.forEach(s=>{
       if(!seenSources.includes(s.name) && !visible.has(s.name)){ visible.add(s.name); changed = true; }
     });
@@ -310,7 +315,7 @@ function updPickSum(){
 
 // 首次打开（本地没有记录）弹一次选择面板
 function maybeOpenPicker(){
-  if(visible || pickerShown) return;
+  if(hasSaved || pickerShown) return;
   if(!lastData || !(lastData.sources||[]).length) return;
   pickerShown = true;
   firstPick = true;
@@ -617,6 +622,7 @@ document.querySelectorAll('button.tab').forEach(b=>{
 });
 
 loadVisible();          // 先读本地选择，首屏 chips 就是筛过的状态
+ensureVisible();        // 没存过记录的，先按「一位都没选」渲染，等引导面板
 paintFromCache();
 load();
 startTimers();
