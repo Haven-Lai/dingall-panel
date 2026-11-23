@@ -652,6 +652,129 @@ def is_trading_now(now=None):
     return (9 * 60 + 15) <= t <= (15 * 60 + 5)
 
 
+# ---------------------------------------------------------------- 涨停个股明细
+#
+# 「连板数」和「板块」只有东财涨停池有（lbc / hybk），
+# 「题材」只有同花顺涨停池有（reason_type，形如 "算力租赁+色纺纱"）。
+# 所以这个视图必须两个源合起来，单靠任何一个都做不出来：
+#   东财 getTopicZTPool -> 以它为主（连板、板块、封单、首封时间）
+#   同花顺 limit_up_pool -> 按代码补一列题材
+# 两次请求都是现成的，不额外增加上游压力。
+
+ZT_STOCK_TTL = 25          # 情绪快照 40 秒一刷，这里稍快些，新涨停能先看到
+_ZT_STOCK_LOCK = threading.Lock()
+
+
+def _fbt_str(v):
+    """东财 fbt 是 93133 这种整数（HHMMSS）-> '09:31:33'。"""
+    try:
+        s = str(int(v)).zfill(6)
+    except Exception:
+        return ""
+    return "%s:%s:%s" % (s[0:2], s[2:4], s[4:6])
+
+
+def _fetch_zt_pool_rich(ymd):
+    """东财涨停池明细，返回 (pool, qdate)。
+
+    ⚠️ qdate 是东财回给的真实交易日：盘前、周末、节假日查「今天」时它给的是
+    上一个交易日。必须拿它去问同花顺要题材，否则两边日期错位，题材会整列全空。
+    """
+    url = ("%sgetTopicZTPool?ut=%s&dpt=wz.ztzt&Pageindex=0&pagesize=300&sort=fbt%%3Aasc&date=%s"
+           % (EX_BASE, EX_UT, ymd))
+    d = http_json(url, EX_HEADERS, timeout=8, retries=2)
+    if not d or d.get("rc") != 0 or not d.get("data"):
+        return [], ""
+    data = d["data"]
+    return (data.get("pool") or []), str(data.get("qdate") or "")
+
+
+def _fetch_ths_reason(ymd):
+    """同花顺涨停原因 {代码: '题材A+题材B'}。失败返回 {}，绝不能拖垮整个列表。"""
+    info, _total = fetch_limit_up_pool(ymd, limit=200)
+    out = {}
+    for s in info:
+        c = str(s.get("code") or "").strip()
+        r = (s.get("reason_type") or "").strip()
+        if c and r:
+            out[c] = r
+    return out
+
+
+def _build_zt_stocks():
+    today_ymd = datetime.now().strftime("%Y%m%d")
+    pool, qdate = _fetch_zt_pool_rich(today_ymd)
+    if not pool:
+        return None
+    ymd = qdate or today_ymd
+    reasons = _fetch_ths_reason(ymd)
+
+    rows = []
+    for p in pool:
+        code = str(p.get("c") or "").strip()
+        if not code:
+            continue
+        lbc = to_num(p.get("lbc"))
+        lbc = int(lbc) if lbc else 1          # 东财没给就当首板，别让它掉出列表
+        zttj = p.get("zttj") or {}
+        rows.append({
+            "code": code,
+            "name": (p.get("n") or "").strip(),
+            "lbc": lbc,
+            "board": (p.get("hybk") or "").strip(),        # 行业板块
+            "reason": reasons.get(code, ""),               # 题材（同花顺）
+            "fund": round((to_num(p.get("fund")) or 0) / 1e8, 2),    # 封单(亿)
+            "fbt": _fbt_str(p.get("fbt")),                 # 首次封板时间
+            "zbc": int(to_num(p.get("zbc")) or 0),         # 炸板次数
+            "hs": round(float(to_num(p.get("hs")) or 0), 1),
+            "amount": round((to_num(p.get("amount")) or 0) / 1e8, 2),
+            "pct": round(float(to_num(p.get("zdp")) or 0), 2),
+            "days": int(to_num(zttj.get("days")) or 0),    # 「N天M板」里的 N
+            "dct": int(to_num(zttj.get("ct")) or 0),       # 「N天M板」里的 M
+        })
+
+    groups = []
+    for lbc in sorted({r["lbc"] for r in rows}, reverse=True):
+        items = [r for r in rows if r["lbc"] == lbc]
+        # 同一梯队里封单大的排前面：封单就是资金决心，超短先看这个
+        items.sort(key=lambda x: (-x["fund"], x["fbt"] or "99:99:99"))
+        groups.append({
+            "lbc": lbc,
+            "label": ("首板" if lbc == 1 else "%d连板" % lbc),
+            "count": len(items),
+            "stocks": items,
+        })
+
+    return {
+        "ok": True,
+        "ymd": ymd,
+        "date": ("%s-%s-%s" % (ymd[0:4], ymd[4:6], ymd[6:8])) if len(ymd) == 8 else ymd,
+        "live": is_trading_now(),
+        "total": len(rows),
+        "with_reason": sum(1 for r in rows if r["reason"]),
+        "groups": groups,
+        "updated": datetime.now().strftime("%H:%M:%S"),
+        "source": "东方财富 涨停池（连板/板块/封单）＋ 同花顺 涨停原因（题材）",
+    }
+
+
+def zt_stocks_payload():
+    """涨停个股按连板数分组，每只附题材与板块。
+
+    25 秒内存缓存；抓失败退回上一次的结果，不把已经看到的列表清空。
+    """
+    now = time.time()
+    with _ZT_STOCK_LOCK:
+        cache = STATE.get("zt_stocks")
+        if cache and now - float(cache.get("ts") or 0) < ZT_STOCK_TTL:
+            return cache["data"]
+        data = _build_zt_stocks()
+        if data:
+            STATE["zt_stocks"] = {"ts": now, "data": data}
+            return data
+        return cache["data"] if cache else None
+
+
 def previous_trading_day():
     d = datetime.now() - timedelta(days=1)
     for _ in range(10):

@@ -74,6 +74,29 @@
   .bk .empty { color: #a0a6b4; font-size: 12px; }
   .bk .leader { font-size: 11.5px; color: #6b7280; margin-top: 4px; }
 
+  /* ---- 涨停个股（按连板分组） ---- */
+  #ztbody { display: flex; flex-direction: column; gap: 11px; }
+  .ztgroup { background: #fff; border-radius: 12px; padding: 12px 14px; box-shadow: 0 2px 8px rgba(0,0,0,.05); }
+  .ztgh { display: flex; align-items: center; gap: 9px; margin-bottom: 9px; flex-wrap: wrap; }
+  .ztlbc { font-size: 13px; font-weight: 800; color: #fff; background: #e03b3b;
+           border-radius: 6px; padding: 2px 10px; letter-spacing: .3px; }
+  .ztlbc.h2 { background: #f0782c; }
+  .ztlbc.h3 { background: #e08a00; }
+  .ztlbc.h5 { background: #b91c1c; }
+  .ztlbc.h1 { background: #a8b0c0; }
+  .ztcnt { font-size: 11.5px; color: #8a90a0; }
+  .ztrows { display: grid; grid-template-columns: repeat(auto-fill, minmax(272px, 1fr)); gap: 7px; }
+  .ztrow { border: 1px solid #eef1f6; border-radius: 9px; padding: 7px 10px; background: #fcfdff; }
+  .ztrow .r1 { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+  .ztrow .nm { font-weight: 700; font-size: 13px; }
+  .ztrow .cd { color: #a0a6b4; font-size: 11px; }
+  .ztrow .mt { margin-left: auto; font-size: 11px; color: #8a90a0; font-variant-numeric: tabular-nums; }
+  .ztrow .r2 { margin-top: 5px; display: flex; flex-wrap: wrap; gap: 4px; }
+  .tag { font-size: 11px; border-radius: 4px; padding: 1px 6px; line-height: 1.6; white-space: nowrap; }
+  .tag-rs { background: #fff1f0; color: #c0392b; border: 1px solid #ffd9d5; }
+  .tag-bd { background: #eef4ff; color: #2563eb; border: 1px solid #dbe6ff; }
+  .tag-none { background: #f4f5f7; color: #a0a6b4; border: 1px solid #e9ebef; }
+
   .disclaimer { font-size: 11px; color: #a0a6b4; margin: 18px 0 6px; line-height: 1.5; }
   .loading { text-align: center; color: #8a90a0; padding: 30px; font-size: 14px; }
   .err { background: #fff3f3; color: #c0392b; border-radius: 10px; padding: 14px 16px; font-size: 13px; }
@@ -133,6 +156,14 @@
         涨停少但几乎全是首板＝冰点里已有资金试盘。
       </div>
     </div>
+  </div>
+
+  <!-- 涨停个股明细：按连板分组，每只附题材与行业板块。
+       和 #boards 分开放，是因为它有自己的刷新节奏和降级路径，
+       混进板块榜里会让「哪个是主线、哪个是明细」分不清。 -->
+  <div id="ztsection" style="display:none">
+    <div class="sec-title">涨停个股 · 按连板分组 <span class="pill" id="ztpill">加载中…</span><span class="desc">每只附题材（同花顺涨停原因）＋ 行业板块（东财）｜ 同一梯队内按封单金额从大到小</span></div>
+    <div id="ztbody"></div>
   </div>
 
   <div id="boards"></div>
@@ -355,10 +386,12 @@ function render(data) {
   document.getElementById("klsection").style.display = "block";
   document.getElementById("status").textContent = "已更新 " + data.time;
   loadKline();
+  loadZtStocks();
 }
 
 function showError(msg) {
   document.getElementById("klsection").style.display = "none";
+  document.getElementById("ztsection").style.display = "none";
   document.getElementById("boards").innerHTML = "";
   document.getElementById("content").innerHTML = `<div class="err">数据获取失败：${esc(msg)}<br>可能原因：1）网络不通；2）浏览器拦截跨域请求（换 Chrome 打开）；3）数据源临时限流（点「立即刷新」重试）。<br><br>手动判断法：同花顺「涨停板」专区看涨停/跌停/连板数，涨停≥50且跌停≤5＝环境好；涨停&lt;20或跌停≥15＝收手。</div>`;
 }
@@ -773,6 +806,101 @@ async function loadKline() {
       cur.innerHTML = '<div class="loading" style="padding:80px 0">涨跌停走势暂不可用（'
         + esc(e && e.message ? e.message : e) + '）<br>点右上角「立即刷新」重试</div>';
     }
+  }
+}
+
+/* ============ 涨停个股（按连板分组，附题材与板块） ============ */
+let _ztKey = "";
+
+function ztLbcClass(lbc) {
+  if (lbc >= 5) return "h5";
+  if (lbc >= 4) return "h3";
+  if (lbc >= 2) return "h2";
+  return "h1";
+}
+
+/* 题材是「算力租赁+色纺纱+国改」这种 + 号串。拆成小标签，扫一眼就知道
+ * 这只股同时挂了哪几个方向；整坨塞一个标签里等于没写。
+ *
+ * ⚠️ 东财 hybk（行业板块）会截断到 4 个字：「汽车零部件」→「汽车零部」、
+ * 「电子化学品」→「电子化学」，而同花顺题材给的是全称。两个都显示就像
+ * 同一句话写了两遍。这里只在「明显是同一个词的截断」（差 1 个字）时合并成
+ * 全称，不从题材里乱删词 —— 否则「电池」+「电池回收」这种不同题材会被误吞。 */
+function ztSplitTags(board, reason) {
+  const raw = String(reason || "").split(/[+＋]/).map(s => s.trim()).filter(Boolean);
+  if (!raw.length) return { board: board || "", reasons: [], noReason: true };
+  let best = board || "";
+  const reasons = [];
+  raw.forEach(p => {
+    if (board && p === board) { if (p.length > best.length) best = p; return; }
+    if (board && p.startsWith(board) && p.length - board.length === 1) { best = p; return; }
+    reasons.push(p);
+  });
+  return { board: best, reasons, noReason: false };
+}
+
+function renderZtStocks(d) {
+  const box = document.getElementById("ztbody");
+  if (!box) return;
+  document.getElementById("ztsection").style.display = "block";
+  const pill = document.getElementById("ztpill");
+  if (pill) pill.textContent = d.total + " 只 · " + (d.date || "");
+
+  // 数据没变就别重写 DOM：40 秒一轮刷新里绝大多数时候是白刷
+  const key = d.ymd + "|" + d.groups.map(g => g.lbc + ":" + g.stocks.map(s => s.code + s.fund).join(",")).join(";");
+  if (key === _ztKey) return;
+  _ztKey = key;
+
+  let h = "";
+  d.groups.forEach(g => {
+    h += `<div class="ztgroup"><div class="ztgh">`
+       + `<span class="ztlbc ${ztLbcClass(g.lbc)}">${esc(g.label)}</span>`
+       + `<span class="ztcnt">${g.count} 只</span></div><div class="ztrows">`;
+    g.stocks.forEach(s => {
+      const meta = [];
+      if (s.fund > 0) meta.push("封单 " + Number(s.fund).toFixed(2) + "亿");
+      if (s.fbt) meta.push(s.fbt.slice(0, 5) + " 首封");
+      if (s.zbc > 0) meta.push("炸" + s.zbc);
+      const tg = ztSplitTags(s.board, s.reason);
+      const boardTag = tg.board ? `<span class="tag tag-bd">${esc(tg.board)}</span>` : "";
+      const reasonHtml = tg.noReason
+        ? `<span class="tag tag-none">题材待标注</span>`
+        : tg.reasons.map(p => `<span class="tag tag-rs">${esc(p)}</span>`).join("");
+      // 「5天3板」这类非连续板，光看连板数会误解，单独标出来
+      const multi = (s.days && s.dct && s.days !== s.dct)
+        ? `<span class="tag tag-none">${s.days}天${s.dct}板</span>` : "";
+      h += `<div class="ztrow">`
+         + `<div class="r1"><span class="nm">${esc(s.name)}</span>`
+         + `<span class="cd">${esc(s.code)}</span>`
+         + `<span class="mt">${esc(meta.join(" · "))}</span></div>`
+         + `<div class="r2">${boardTag}${reasonHtml}${multi}</div></div>`;
+    });
+    h += `</div></div>`;
+  });
+  box.innerHTML = h;
+}
+
+async function loadZtStocks() {
+  const box = document.getElementById("ztbody");
+  if (!box) return;
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 20000);
+    let d;
+    try {
+      const r = await fetch("/api/zt-stocks", { cache: "no-store", signal: ctl.signal });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      d = await r.json();
+    } finally { clearTimeout(timer); }
+
+    if (!d || d.ok === false || !Array.isArray(d.groups) || !d.groups.length) {
+      throw new Error((d && d.error) || "暂无涨停个股");
+    }
+    renderZtStocks(d);
+  } catch (e) {
+    // 已经画出来了就保持原样，别因为一次抖动把整块列表擦掉
+    if (document.querySelector("#ztbody .ztgroup")) return;
+    box.innerHTML = `<div class="note">涨停个股暂不可用（${esc(e && e.message ? e.message : e)}）<br>点右上角「立即刷新」重试</div>`;
   }
 }
 

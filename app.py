@@ -194,6 +194,18 @@ class Handler(BaseHTTPRequestHandler):
                 data = {"ready": False, "error": str(e)[:200], "series": []}
             return self._send(200, json.dumps(data, ensure_ascii=False))
 
+        if path in ("/api/zt-stocks", "/api/ztstocks"):
+            # 涨停个股（按连板分组，每只附题材与板块）。
+            # 需要两个上游：东财涨停池给连板/板块/封单，同花顺给涨停原因（题材），
+            # 服务端合并 + 缓存 25 秒，前端一个请求拿完。
+            try:
+                data = sentiment_core.zt_stocks_payload()
+            except Exception as e:
+                data = {"ok": False, "error": str(e)[:200], "groups": []}
+            if data is None:
+                data = {"ok": False, "error": "涨停池暂无数据（上游未响应）", "groups": []}
+            return self._send(200, json.dumps(data, ensure_ascii=False))
+
         if path in ("/api/health", "/healthz"):
             with LOCK:
                 return self._send(200, json.dumps({
