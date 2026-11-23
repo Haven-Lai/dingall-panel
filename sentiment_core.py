@@ -459,9 +459,14 @@ ZT_LIVE_TTL = 20
 
 # 要凑满 30 个交易日：last_trading_dates 只按工作日筛，不认节假日，
 # 国庆那种长假会白占 5~7 个名额，所以扫 45 个工作日留足余量。
-# 并发数一起决定冷启动时 K 线图多久能出来，别随手调大（同花顺容易限流）。
+#
+# ⚠️ 并发别往上调。本地 10 并发能 0.5 秒扫完，但**线上不是一回事**：
+#    Render 出海 + 东财对历史查询的频率敏感，实测 10 并发下 22 天里能成 9 天的都算好，
+#    线上曾经只剩 7 天且日期是散的（11-03/04/06/09/17/19/23）—— 那是限流不是深度。
+#    降到 6 并发、失败再降 3 并发补扫一轮，成功率才靠得住。
 ZT_HIST_DAYS = 45
-ZT_HIST_WORKERS = 10
+ZT_HIST_WORKERS = 6
+ZT_HIST_RETRY_WORKERS = 3
 ZT_HIST_THS_WORKERS = 4
 
 # 磁盘缓存只做加法：没被窗口盖住的老日子留着，跌停家数就能跟着天累积。
@@ -485,7 +490,9 @@ def fetch_pool_count(kind, ymd):
     sort = "fbt%3Aasc" if kind == "ZT" else "fund%3Aasc"
     url = ("%sgetTopic%sPool?ut=%s&dpt=wz.ztzt&Pageindex=0&pagesize=300&sort=%s&date=%s"
            % (EX_BASE, kind, EX_UT, sort, ymd))
-    d = http_json(url, EX_HEADERS, timeout=8, retries=2)
+    # timeout 给 12 秒：本地 8 秒够，但 Render 出海再回来经常 6~9 秒，
+    # 卡在 8 秒会把本来能成的请求判死，读出来就是「历史深度只有 7 天」。
+    d = http_json(url, EX_HEADERS, timeout=12, retries=2)
     if not d or d.get("rc") != 0 or not d.get("data"):
         return None
     data = d["data"]
@@ -551,18 +558,48 @@ def _zt_hist_ths(dstr):
     return (dstr, zt, first)
 
 
-def _zt_hist_full(days):
-    """并发扫最近 days 个工作日，返回有数据的 [{d, zt, dt, first, src}]（升序）。
+def _zt_scan_em(dates, workers):
+    """低并发扫东财涨停池，返回 (成功 {日期: (zt, first)}, 失败日期列表)。"""
+    ok, bad = {}, []
+    if not dates:
+        return ok, bad
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for d, r in zip(dates, ex.map(_zt_hist_zt, dates)):
+            if r and r[1] > 0:
+                ok[d] = (int(r[1]), (int(r[2]) if r[2] is not None else None))
+            else:
+                bad.append(d)
+    return ok, bad
 
-    两段式：先并发问东财（近 15 天有数据），再把东财没覆盖到的日子丢给同花顺补。
-    兜底只补涨停/首板；跌停没有第二个源，只在东财有数据的日子取，其余留 None。
+
+def _dt_scan(dates, workers):
+    """扫跌停池，返回 {日期: 家数}；抓失败的日期直接不进字典（= 留 null）。"""
+    ok = {}
+    if not dates:
+        return ok
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for d, v in zip(dates, ex.map(_zt_hist_dt, dates)):
+            if v is not None:
+                ok[d] = int(v)
+    return ok
+
+
+def _zt_hist_full(days):
+    """扫最近 days 个工作日，返回有数据的 [{d, zt, dt, first, src}]（升序）。
+
+    三段式：东财涨停池（失败降并发补一轮）-> 同花顺补东财没覆盖到的日子
+    -> 跌停池只问东财认得的日期（深度外问了恒为 0，白送请求还会画错）。
     """
     dates = list(reversed(last_trading_dates(days)))   # 旧 -> 新
 
-    with ThreadPoolExecutor(max_workers=ZT_HIST_WORKERS) as ex:
-        em_rows = [x for x in ex.map(_zt_hist_zt, dates) if x]
-    got = {r[0]: (int(r[1]), (int(r[2]) if r[2] is not None else None), "em")
-           for r in em_rows if r[1] > 0}
+    em_ok, em_bad = _zt_scan_em(dates, ZT_HIST_WORKERS)
+    if em_bad:
+        # 第二轮降并发补扫。线上第一轮常常丢一半（限流），不补这一轮的话
+        # 图上的日期会变成断断续续的一串，看着像数据丢了。
+        em2, em_bad = _zt_scan_em(em_bad, ZT_HIST_RETRY_WORKERS)
+        em_ok.update(em2)
+
+    got = {d: (v[0], v[1], "em") for d, v in em_ok.items()}
 
     missing = [d for d in dates if d not in got]
     if missing:
@@ -575,14 +612,37 @@ def _zt_hist_full(days):
     if not got:
         return []
     valid = sorted(got)
-    # 只对东财覆盖到的日子问跌停池：深度外的日子问了也是 0，白送请求还画错。
+
     dt_dates = [d for d in valid if got[d][2] == "em"]
-    with ThreadPoolExecutor(max_workers=ZT_HIST_WORKERS) as ex:
-        dt_vals = list(ex.map(_zt_hist_dt, dt_dates)) if dt_dates else []
-    dt_map = dict(zip(dt_dates, dt_vals))
+    dt_map = _dt_scan(dt_dates, ZT_HIST_WORKERS)
+    lost = [d for d in dt_dates if d not in dt_map]
+    if lost:
+        dt_map.update(_dt_scan(lost, ZT_HIST_RETRY_WORKERS))
 
     return [{"d": d, "zt": got[d][0], "dt": dt_map.get(d),
              "first": got[d][1], "src": got[d][2]} for d in valid]
+
+
+def zt_hist_diag(days=18):
+    """排查用：**串行**逐个问东财涨停池/跌停池，看线上到底哪几天拿不到、各花多久。
+
+    线上跟本地不是一回事（Render 出海、东财对历史查询限流），出问题时不要靠猜，
+    直接 curl /api/zt-diag 看每一行的 tc 和耗时。
+    """
+    rows = []
+    for d in reversed(last_trading_dates(days)):
+        t0 = time.time()
+        zt = fetch_pool_count("ZT", d.replace("-", ""))
+        dt = fetch_pool_count("DT", d.replace("-", ""))
+        rows.append({
+            "d": d,
+            "zt": (zt or {}).get("tc"),
+            "first": (zt or {}).get("first"),
+            "dt": (dt or {}).get("tc"),
+            "ms": int((time.time() - t0) * 1000),
+        })
+    return {"days": len(rows), "rows": rows,
+            "hint": "zt/dt 为 null = 该日请求失败；tc=0 = 上游没有这天的数据"}
 
 
 def _zt_hist_load():

@@ -181,8 +181,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path in ("/api/zt-kline", "/api/ztkline"):
             # 情绪看板的涨跌停家数走势图：数据走东财涨停池/跌停池（与页面卡片同口径），
-            # 由服务端抓 + 缓存，前端只发这一个请求 —— 否则浏览器要发 30 个跨域
-            # JSONP 才能凑出 15 天，既占满并发又容易被东财限流。
+            # 由服务端抓 + 缓存，前端只发这一个请求 —— 否则浏览器要发 90 个跨域
+            # JSONP 才能凑出 30 天，既占满并发又容易被东财限流。
             try:
                 limit = int(parse_qs(u.query).get("limit", ["30"])[0])
             except Exception:
@@ -192,6 +192,20 @@ class Handler(BaseHTTPRequestHandler):
                 data = sentiment_core.zt_kline_payload(limit=limit)
             except Exception as e:
                 data = {"ready": False, "error": str(e)[:200], "series": []}
+            return self._send(200, json.dumps(data, ensure_ascii=False))
+
+        if path in ("/api/zt-diag", "/api/ztdiag"):
+            # 排查用：串行逐日问东财，看线上哪几天拿不到、各花多久。
+            # 线上出过「图只有 7 天且日期是散的」—— 那是限流不是历史深度，
+            # 光看 /api/zt-kline 分不出来，得看每一行的 tc 和耗时。
+            try:
+                n = int(parse_qs(u.query).get("days", ["18"])[0])
+            except Exception:
+                n = 18
+            try:
+                data = sentiment_core.zt_hist_diag(days=max(5, min(30, n)))
+            except Exception as e:
+                data = {"error": str(e)[:200], "rows": []}
             return self._send(200, json.dumps(data, ensure_ascii=False))
 
         if path in ("/api/zt-stocks", "/api/ztstocks"):
