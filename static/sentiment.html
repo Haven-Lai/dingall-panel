@@ -143,7 +143,7 @@
        #content，图表 DOM 在里面的话每 40 秒刷新就被销毁重建、闪一下。
        拆出来之后图表只初始化一次，数据变了才重绘。 -->
   <div id="klsection" style="display:none">
-    <div class="sec-title">涨停 / 首板 / 跌停家数（每日收盘） <span class="pill" id="klpill">加载中…</span><span class="desc">红绿两线收窄＝情绪转弱；红线与橙线间距宽＝新资金在扩散，贴得死紧＝全靠高位连板</span></div>
+    <div class="sec-title">涨停 / 首板 / 跌停家数（每日收盘） <span class="pill" id="klpill">加载中…</span><span class="desc">红绿两线收窄＝情绪转弱；红线与橙线间距宽＝新资金在扩散，贴得死紧＝全靠高位连板｜跌停线仅近 15 日</span></div>
     <div class="chartcard">
       <div id="klchart"><div class="loading" style="padding:90px 0">正在计算涨跌停历史…</div></div>
       <div class="kllegend">
@@ -154,6 +154,9 @@
         <br><b>首板</b>＝当天首次涨停的家数（连板数 1），是涨停数的子集。
         看的是<b>橙线与红线的间距</b>：涨停多而首板跟不上＝资金在抱团高位连板、新资金不敢接手；
         涨停少但几乎全是首板＝冰点里已有资金试盘。
+        <br><b>跌停线</b>只有近 15 个交易日：东财跌停池的历史深度就这么深，同花顺没有跌停池接口，
+        更早的日子留空不画（不拿别的口径凑数，也不补 0）。线上服务每天会把当天结果存进磁盘，
+        跌停的历史会随运行天数自己往前长。
       </div>
     </div>
   </div>
@@ -509,7 +512,7 @@ async function load() {
  * 为什么不让浏览器自己抓：凑 20 天要发 40+ 个跨域 JSONP，既占满浏览器
  * 到东财的并发（本页板块榜还要用它），又容易撞限流。服务端抓一次全页共用。
  */
-const KL_CACHE = "kl_zt_v1";
+const KL_CACHE = "kl_zt_v2";
 // 前端缓存时长分两档：已收盘（历史日不会再变）可以久一点，盘中那根 20 秒就变，
 // 缓存久了会出现「卡片写 45、图上今日点写 32」。页面本身 40 秒整页刷新一次，
 // 所以盘中这一档设成 25 秒，保证图跟卡片基本同步。
@@ -579,7 +582,9 @@ function klOption(rows) {
   // localStorage 里可能还留着旧 payload，这里兜一下 —— 取不到值会让 data 全是
   // undefined，ECharts 连 y 轴范围都算不出来，整个绘图区空白且不报错。
   const ZT = r => (r.zt != null ? r.zt : r.zc);
-  const DT = r => (r.dt != null ? r.dt : r.dc);
+  // 跌停只有东财一个源，历史深度外后端给的就是 null（见 sentiment_core 的说明）。
+  // 一路 null 到底，绝不兜 0 —— 0 会画成「那天一家跌停都没有」。
+  const DT = r => (r.dt != null ? r.dt : (r.dc != null ? r.dc : null));
   // 首板数＝涨停池里连板数(lbc) 为 1 的家数。老缓存没有这个字段，给 null 让线
   // 断开，绝不能兜成 0 —— 0 会画成「那天一只首板都没有」，跟事实正好相反。
   const FS = r => (r.first != null ? r.first : (r.fs != null ? r.fs : null));
@@ -641,11 +646,12 @@ function klOption(rows) {
         if (!r) return "";
         const prev = i > 0 ? rows[i - 1] : null;
         const dz = prev ? ZT(r) - ZT(prev) : 0;
-        const dd = prev ? DT(r) - DT(prev) : 0;
+        // 跌停可能为 null（上游历史不够），差值要先判空，否则会算出 NaN
+        const dd = (prev && DT(r) != null && DT(prev) != null) ? DT(r) - DT(prev) : null;
         const sgn = v => (v > 0 ? "+" : "") + v;
         // 涨停增＝红（转强），跌停增＝绿（恶化），都按「情绪好坏」上色
         const cz = dz > 0 ? RED : (dz < 0 ? GREEN : "#8a90a0");
-        const cd = dd > 0 ? GREEN : (dd < 0 ? RED : "#8a90a0");
+        const cd = dd == null ? "#8a90a0" : (dd > 0 ? GREEN : (dd < 0 ? RED : "#8a90a0"));
         const ratio = DT(r) ? (ZT(r) / DT(r)).toFixed(1) : "∞";
         const f = FS(r);
         const fShare = (f != null && ZT(r)) ? Math.round(f * 100 / ZT(r)) : null;
@@ -661,9 +667,11 @@ function klOption(rows) {
                 + (fShare != null
                     ? ' <span style="color:#8a90a0">占涨停 ' + fShare + '%</span>' : "")
               : '')
-          + '<br><span style="color:' + GREEN + '">●</span> 跌停 <b>' + DT(r) + '</b> 家'
-          + (prev ? ' <span style="color:' + cd + '">' + sgn(dd) + '</span>' : "")
-          + '<br><span style="color:#8a90a0">涨跌停比 ' + ratio + '</span>';
+          + (DT(r) == null
+              ? '<br><span style="color:' + GREEN + '">●</span> 跌停 <span style="color:#a0a6b4">— 上游仅保留近 15 个交易日</span>'
+              : '<br><span style="color:' + GREEN + '">●</span> 跌停 <b>' + DT(r) + '</b> 家'
+                + (dd != null ? ' <span style="color:' + cd + '">' + sgn(dd) + '</span>' : "")
+                + '<br><span style="color:#8a90a0">涨跌停比 ' + ratio + '</span>');
       }
     },
     xAxis: {

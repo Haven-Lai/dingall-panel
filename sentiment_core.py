@@ -435,7 +435,15 @@ def build_kline(history, today_str, today_ohlc, limit=30):
 #    看着像「跌停池没数据」，实际是排序字段不被接受。跌停池必须用 fund:asc。
 #
 # ⚠️ 历史深度只有约 15 个交易日：再往前 tc 一律返回 0、pool 为空。
-#    这不是 bug，也不需要"修复"，多扫几天拿到多少算多少。
+#    这不是 bug，也不需要"修复"。想要更长的历史只能换源 —— 见下面的同花顺回补。
+#
+# ⚠️ 同花顺涨停池（limit_up_pool 带 date 参数）实测能回溯 35+ 个交易日，
+#    所以 30 天视图 = 东财给近 15 天 + 同花顺补前面那些天。东财优先是刻意的：
+#    顶部卡片的涨停家数就是东财口径，最近这段必须跟卡片严丝合缝。
+#
+# ⚠️ 跌停家数没有第二个源：同花顺没有跌停池接口（dataapi/limit_down/* 全是 404），
+#    东财跌停池的历史深度跟涨停池一样只有 ~15 个交易日。所以跌停那条线只能
+#    画最近 15 天，更早的日期给 null 让线断开 —— 绝不能用别的口径凑数。
 
 EX_BASE = "https://push2ex.eastmoney.com/"
 EX_UT = "7eea3edcaed734bea9cbfc24409ed989"
@@ -443,14 +451,22 @@ EX_HEADERS = {"Referer": "https://quote.eastmoney.com/"}
 
 ZT_HIST_FILE = os.path.join(DATA_DIR, "zt_history.json")
 
-# 历史日一整天不会变，但当日那根要跟着盘中跳动，所以拆成两档 TTL
-ZT_FULL_TTL = 1800
+# 历史日一整天不会变，但当日那根要跟着盘中跳动，所以拆成两档 TTL。
+# 全量重扫一次要打 ~90 个上游请求（东财 45 + 同花顺 30 + 跌停 15），别调太勤；
+# 历史日是定值，只有跨天才必须重扫，TTL 只是兜底（东财偶尔补数据慢）。
+ZT_FULL_TTL = 10800
 ZT_LIVE_TTL = 20
 
-# 历史深度 ~15 个交易日，扫 22 个工作日刚好盖住；并发 10 实测 0.5 秒内扫完。
-# 这两个数一起决定冷启动时 K 线图多久能出来，别随手调大。
-ZT_HIST_DAYS = 22
+# 要凑满 30 个交易日：last_trading_dates 只按工作日筛，不认节假日，
+# 国庆那种长假会白占 5~7 个名额，所以扫 45 个工作日留足余量。
+# 并发数一起决定冷启动时 K 线图多久能出来，别随手调大（同花顺容易限流）。
+ZT_HIST_DAYS = 45
 ZT_HIST_WORKERS = 10
+ZT_HIST_THS_WORKERS = 4
+
+# 磁盘缓存只做加法：没被窗口盖住的老日子留着，跌停家数就能跟着天累积。
+# 攒到 ZT_HIST_KEEP 天就从头砍，防止文件无限长。
+ZT_HIST_KEEP = 120
 
 _ZT_HIST_LOCK = threading.Lock()
 
@@ -496,33 +512,77 @@ def _zt_hist_zt(dstr):
 
 
 def _zt_hist_dt(dstr):
+    """东财跌停家数。失败给 None（= 没数据，线断开），**不能给 0**。"""
     r = fetch_pool_count("DT", dstr.replace("-", ""))
-    return (r["tc"] if r else 0)
+    return (r["tc"] if r else None)
+
+
+def _ths_first_count(info):
+    """从同花顺 high_days 数出「连板数为 1」的家数，对齐东财的 lbc == 1。
+
+    同花顺的标签有两类写法，含义完全不同：
+      "首板" / "2天2板" / "5天5板"  -> N 天 N 板，是连续板，连板数 = N
+      "5天3板" / "7天5板"           -> N 天 M 板（N≠M），中途断过板，
+                                       今天这次是重新起的第一板，连板数 = 1
+    只按 "首板" 字面数会漏掉后一类，实测会少 3~15 家（涨停多的大日子漏得最多），
+    所以必须补上。补完跟东财 lbc==1 逐日对比：多数日子完全相等，个别日子差 ≤4 只。
+    """
+    n = 0
+    for s in info:
+        h = (s.get("high_days") or "").strip()
+        if h == "首板":
+            n += 1
+            continue
+        m = re.match(r"^(\d+)天(\d+)板$", h)
+        if m and m.group(1) != m.group(2):
+            n += 1
+    return n
+
+
+def _zt_hist_ths(dstr):
+    """同花顺回补某一天的涨停/首板（东财历史深度外才用）。返回同结构元组或 None。"""
+    info, total = fetch_limit_up_pool(dstr.replace("-", ""), limit=200)
+    if total <= 0 or not info:
+        return None
+    zt = int(total)
+    # limit 200 是上游硬上限，历史峰值 125 家。真被截断就宁可给 None，
+    # 也不要拿半页明细算出一个偏小的首板数（会画成"首板突然塌了"）。
+    first = _ths_first_count(info) if zt <= len(info) else None
+    return (dstr, zt, first)
 
 
 def _zt_hist_full(days):
-    """并发扫最近 days 个工作日，返回有数据的 [{d, zt, dt}]（升序）。
+    """并发扫最近 days 个工作日，返回有数据的 [{d, zt, dt, first, src}]（升序）。
 
-    东财池的历史深度实测只有 ~15 个交易日，再往前 tc 恒为 0。所以这里默认只扫
-    22 个工作日（刚好盖住 + 一点缓冲）：扫太多纯属给东财送了 30 个必然返回 0
-    的请求，白等半分钟。真要更长历史，把 days 调大即可，逻辑不用动。
+    两段式：先并发问东财（近 15 天有数据），再把东财没覆盖到的日子丢给同花顺补。
+    兜底只补涨停/首板；跌停没有第二个源，只在东财有数据的日子取，其余留 None。
     """
     dates = list(reversed(last_trading_dates(days)))   # 旧 -> 新
 
-    # 两段并发：先筛涨停池，再只对有效日期补跌停池（省一半请求）
     with ThreadPoolExecutor(max_workers=ZT_HIST_WORKERS) as ex:
-        zt_rows = [x for x in ex.map(_zt_hist_zt, dates) if x]
-    valid = [(d, zt, fi) for d, zt, fi in zt_rows if zt > 0]
-    if not valid:
-        return []
-    with ThreadPoolExecutor(max_workers=ZT_HIST_WORKERS) as ex:
-        dt_vals = list(ex.map(lambda x: _zt_hist_dt(x[0]), valid))
+        em_rows = [x for x in ex.map(_zt_hist_zt, dates) if x]
+    got = {r[0]: (int(r[1]), (int(r[2]) if r[2] is not None else None), "em")
+           for r in em_rows if r[1] > 0}
 
-    rows = [{"d": d, "zt": int(zt), "dt": int(dt),
-             "first": (int(fi) if fi is not None else None)}
-            for (d, zt, fi), dt in zip(valid, dt_vals)]
-    rows.sort(key=lambda x: x["d"])
-    return rows
+    missing = [d for d in dates if d not in got]
+    if missing:
+        with ThreadPoolExecutor(max_workers=ZT_HIST_THS_WORKERS) as ex:
+            for r in ex.map(_zt_hist_ths, missing):
+                if r and r[1] > 0:
+                    got[r[0]] = (int(r[1]),
+                                 (int(r[2]) if r[2] is not None else None), "ths")
+
+    if not got:
+        return []
+    valid = sorted(got)
+    # 只对东财覆盖到的日子问跌停池：深度外的日子问了也是 0，白送请求还画错。
+    dt_dates = [d for d in valid if got[d][2] == "em"]
+    with ThreadPoolExecutor(max_workers=ZT_HIST_WORKERS) as ex:
+        dt_vals = list(ex.map(_zt_hist_dt, dt_dates)) if dt_dates else []
+    dt_map = dict(zip(dt_dates, dt_vals))
+
+    return [{"d": d, "zt": got[d][0], "dt": dt_map.get(d),
+             "first": got[d][1], "src": got[d][2]} for d in valid]
 
 
 def _zt_hist_load():
@@ -533,11 +593,34 @@ def _zt_hist_load():
     return None
 
 
+def _merge_rows(new_rows, old_rows):
+    """新旧历史按日期合并，字段级「有值优先」——磁盘缓存只做加法。
+
+    两个上游池都只留 ~15 个交易日，窗口每往前滚一天，掉出去那天的跌停家数就
+    永久查不回来了。所以必须把每天的结果攒进磁盘，跌停线才能随时间自己补齐。
+    合并时新扫到的那行不覆盖旧的 dt —— 新扫的行 dt 可能是 None（东财那一下
+    抽风），拿 None 盖掉已经攒到的数字等于自毁历史。
+    """
+    by_day = {}
+    for r in old_rows or []:
+        if isinstance(r, dict) and r.get("d"):
+            by_day[r["d"]] = r
+    for r in new_rows or []:
+        old = by_day.get(r["d"])
+        if old:
+            m = dict(old)
+            m.update({k: v for k, v in r.items() if v is not None})
+            by_day[r["d"]] = m
+        else:
+            by_day[r["d"]] = r
+    return [by_day[d] for d in sorted(by_day)][-ZT_HIST_KEEP:]
+
+
 def build_zt_history(days=ZT_HIST_DAYS):
     """最近可得的交易日涨跌停家数（升序），内存 + 磁盘双缓存。
 
     加锁：bootstrap 预热和 /api/zt-kline 的首次请求可能同时进来，
-    不锁的话两边会各自并发扫 45 个请求，把东财怼到限流。
+    不锁的话两边会各自并发扫 90 个请求，把东财/同花顺怼到限流。
     """
     with _ZT_HIST_LOCK:
         return _build_zt_history_locked(days)
@@ -549,17 +632,20 @@ def _build_zt_history_locked(days):
     cache = STATE.get("zt_hist")
 
     # 跨天 / 从没抓过 / 历史缓存太旧 / 旧缓存里没有 first 字段（加首板线之前
-    # 存的）-> 全量重扫。漏掉最后这条的话，首板线会一直是空的，
-    # 而且要等到跨天才自己好，排查起来极容易误判成「东财没数据」。
+    # 存的）/ 旧缓存只有 15 天（加同花顺回补之前存的，上限卡在 ZT_HIST_DAYS
+    # 的老值）-> 全量重扫。漏掉这些判据的话，旧缓存会一直生效到跨天，
+    # 用户看到的就是「改了代码但还是 15 天」，排查起来极容易误判。
     rows_ready = bool(cache and cache.get("days")
                       and all("first" in r for r in cache["days"]))
     need_full = (not cache or not rows_ready
                  or cache.get("day") != today_str
-                 or now - float(cache.get("full_ts") or 0) > ZT_FULL_TTL)
+                 or now - float(cache.get("full_ts") or 0) > ZT_FULL_TTL
+                 or len(cache.get("days") or []) < 30)
 
     if need_full:
         rows = _zt_hist_full(days)
         if rows:
+            rows = _merge_rows(rows, (cache or {}).get("days"))
             cache = {"day": today_str, "full_ts": now, "days": rows, "live_ts": now}
             STATE["zt_hist"] = cache
             save_json(ZT_HIST_FILE, {"day": today_str, "full_ts": now, "days": rows})
@@ -574,10 +660,11 @@ def _build_zt_history_locked(days):
         if today_row and today_row[1] > 0:
             rows = [r for r in cache["days"] if r["d"] != today_str]
             rows.append({"d": today_str, "zt": int(today_row[1]),
-                         "dt": int(_zt_hist_dt(today_str)),
+                         "dt": _zt_hist_dt(today_str),
                          "first": (int(today_row[2])
-                                   if today_row[2] is not None else None)})
-            rows.sort(key=lambda x: x["d"])
+                                   if today_row[2] is not None else None),
+                         "src": "em"})
+            rows = _merge_rows(rows, cache["days"])
             cache["days"] = rows
             save_json(ZT_HIST_FILE, {"day": cache["day"],
                                      "full_ts": cache["full_ts"], "days": rows})
@@ -609,22 +696,29 @@ def zt_kline_payload(limit=30):
     out = []
     for r in rows:
         is_today = r["d"] == today_str
+        dtv = r.get("dt")
         out.append({
             "d": r["d"],
             "zt": int(r["zt"]),
-            "dt": int(r["dt"]),
+            # 跌停只有东财一个源，历史深度外为 None —— 必须原样透出 null 让前端
+            # 断线。兜 0 会画成「那天一家跌停都没有」，跟事实正好相反。
+            "dt": (int(dtv) if dtv is not None else None),
             "first": (int(r["first"]) if r.get("first") is not None else None),
             "live": is_today,                        # 兼容旧前端字段
             "final": (not is_today) or closed_now,   # 是否已是收盘定值
         })
 
     tail = out[-limit:]
+    dt_from = next((x["d"] for x in tail if x["dt"] is not None), "")
     return {
         "ready": bool(tail),
         "days": len(tail),
         "today": today_str,
         "closed": closed_now,
-        "source": "东方财富 涨停池/跌停池（与看板卡片同口径；首板＝连板数 1 的家数）",
+        "dt_from": dt_from,       # 跌停家数最早可得的日期（更早的日子上游没有）
+        "source": ("东方财富 涨停池/跌停池（与看板卡片同口径；首板＝连板数 1 的家数）；"
+                   "东财只有近 15 个交易日，更早的涨停/首板由同花顺涨停池补齐，"
+                   "跌停无第二数据源，故仅近 15 日"),
         "series": tail,
         "updated": now.strftime("%H:%M:%S"),
     }
