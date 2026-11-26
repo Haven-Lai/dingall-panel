@@ -451,6 +451,13 @@ EX_HEADERS = {"Referer": "https://quote.eastmoney.com/"}
 
 ZT_HIST_FILE = os.path.join(DATA_DIR, "zt_history.json")
 
+# 种子库：跟代码一起提交的「已知历史」，放仓库根目录（data/ 是 gitignore 的）。
+# ⚠️ 为什么要它：Render 免费实例**没有持久磁盘**，每次部署都从 git 重建文件系统，
+#    运行时攒的 data/zt_history.json 会清零。而东财跌停池/炸板池只在窗口内可查，
+#    一旦清零、窗口又已经滚过去，那几天的历史就永久丢了 —— 部署一次图就短一截。
+#    所以把已经抓到的日子落成种子提交上来，启动时先吃种子再合并实时结果。
+ZT_SEED_FILE = os.path.join(BASE_DIR, "zt_hist_seed.json")
+
 # 历史日一整天不会变，但当日那根要跟着盘中跳动，所以拆成两档 TTL。
 # 全量重扫一次要打 ~90 个上游请求（东财 45 + 同花顺 30 + 跌停 15），别调太勤；
 # 历史日是定值，只有跨天才必须重扫，TTL 只是兜底（东财偶尔补数据慢）。
@@ -682,11 +689,20 @@ def zt_hist_diag(days=18):
 
 
 def _zt_hist_load():
-    d = load_json(ZT_HIST_FILE, None)
-    if isinstance(d, dict) and isinstance(d.get("days"), list) and d["days"]:
-        return {"day": str(d.get("day") or ""), "full_ts": float(d.get("full_ts") or 0),
-                "days": d["days"], "live_ts": 0.0}
-    return None
+    """启动时装载历史：仓库里的种子 + 上次运行攒的缓存，按日期合并取并集。
+
+    种子先读、运行时后读，冲突时运行时赢（同一天的话它更新）。
+    """
+    days, full_ts, day = [], 0.0, ""
+    for path in (ZT_SEED_FILE, ZT_HIST_FILE):
+        d = load_json(path, None)
+        if isinstance(d, dict) and isinstance(d.get("days"), list) and d["days"]:
+            days = _merge_rows(d["days"], days)
+            full_ts = max(full_ts, float(d.get("full_ts") or 0))
+            day = day or str(d.get("day") or "")
+    if not days:
+        return None
+    return {"day": day, "full_ts": full_ts, "days": days, "live_ts": 0.0}
 
 
 def _merge_rows(new_rows, old_rows):
@@ -727,12 +743,13 @@ def _build_zt_history_locked(days):
     today_str = datetime.now().strftime("%Y-%m-%d")
     cache = STATE.get("zt_hist")
 
-    # 跨天 / 从没抓过 / 历史缓存太旧 / 旧缓存里缺字段（加首板线、炸板线之前
-    # 存的）/ 旧缓存只有 15 天（加同花顺回补之前存的，上限卡在 ZT_HIST_DAYS
-    # 的老值）-> 全量重扫。漏掉这些判据的话，旧缓存会一直生效到跨天，
-    # 用户看到的就是「改了代码但新线是空的」，排查起来极容易误判。
+    # 跨天 / 从没抓过 / 种子+缓存里一条新字段都没有（加首板线、炸板线之前的格式）
+    # / 旧缓存只有 15 天（加同花顺回补之前的）-> 全量重扫。
+    # ⚠️ 这里用 any 而不是 all：窗口一直往前滚，早就掉出窗口的老日子（比如 9 月那批）
+    #    永远补不上 zb 字段，用 all 判定会**永远是 False**，结果是每 40 秒全量重扫一次，
+    #    把东财和同花顺当自家服务器用。只要有一条新格式的行，就说明这一版跑过了。
     rows_ready = bool(cache and cache.get("days")
-                      and all(("first" in r and "zb" in r) for r in cache["days"]))
+                      and any(("first" in r and "zb" in r) for r in cache["days"]))
     need_full = (not cache or not rows_ready
                  or cache.get("day") != today_str
                  or now - float(cache.get("full_ts") or 0) > ZT_FULL_TTL
