@@ -113,6 +113,7 @@
   }
   .kl-dot-r { background: #e03b3b; }
   .kl-dot-o { background: #f59e0b; }
+  .kl-dot-p { background: #8b5cf6; }
   .kl-dot-g { background: #1aa251; }
 </style>
 </head>
@@ -143,20 +144,26 @@
        #content，图表 DOM 在里面的话每 40 秒刷新就被销毁重建、闪一下。
        拆出来之后图表只初始化一次，数据变了才重绘。 -->
   <div id="klsection" style="display:none">
-    <div class="sec-title">涨停 / 首板 / 跌停家数（每日收盘） <span class="pill" id="klpill">加载中…</span><span class="desc">红绿两线收窄＝情绪转弱；红线与橙线间距宽＝新资金在扩散，贴得死紧＝全靠高位连板｜跌停线仅近 15 日</span></div>
+    <div class="sec-title">涨停 / 首板 / 炸板 / 跌停家数（每日收盘） <span class="pill" id="klpill">加载中…</span><span class="desc">红绿两线收窄＝情绪转弱；红线与橙线间距宽＝新资金在扩散，贴得死紧＝全靠高位连板；紫线抬头＝封不住｜炸板近 14 日、跌停近 15 日</span></div>
     <div class="chartcard">
       <div id="klchart"><div class="loading" style="padding:90px 0">正在计算涨跌停历史…</div></div>
       <div class="kllegend">
         <span class="kl-dot kl-dot-r"></span><b>涨停家数</b>　
         <span class="kl-dot kl-dot-o"></span><b>首板数量</b>　
+        <span class="kl-dot kl-dot-p"></span><b>炸板数量</b>　
         <span class="kl-dot kl-dot-g"></span><b>跌停家数</b>　｜　
         取每个交易日<b>收盘</b>时的家数　｜　空心点＝当日还没收盘，数字仍在变　｜　滚轮可缩放
         <br><b>首板</b>＝当天首次涨停的家数（连板数 1），是涨停数的子集。
         看的是<b>橙线与红线的间距</b>：涨停多而首板跟不上＝资金在抱团高位连板、新资金不敢接手；
         涨停少但几乎全是首板＝冰点里已有资金试盘。
-        <br><b>跌停线</b>只有近 15 个交易日：东财跌停池的历史深度就这么深，同花顺没有跌停池接口，
-        更早的日子留空不画（不拿别的口径凑数，也不补 0）。线上服务每天会把当天结果存进磁盘，
-        跌停的历史会随运行天数自己往前长。
+        <br><b>炸板</b>＝盘中摸到涨停、收盘没封住的家数（紫线）。封板率＝涨停 ÷（涨停＋炸板），
+        紫线抬头＝承接不住，通常比涨停家数掉下来还早一两天，是退潮的第一声警报。
+        ⚠️ 顶部卡片的「炸板率」是全市场行情逐只判定的（还剔了 ST），跟这条线差 1~4 家，
+        别拿两个百分比互相验证。
+        <br><b>炸板线只有近 14 个交易日、跌停线近 15 个</b>：东财这三个池的历史深度不一样
+        （炸板池最浅），而同花顺只有涨停池能回溯，没有跌停池/炸板池的接口。更早的日子
+        留空不画（不拿别的口径凑数，也不补 0）。线上服务每天把当天结果存进磁盘，
+        这两条线的历史会随运行天数自己往前长。
       </div>
     </div>
   </div>
@@ -512,7 +519,7 @@ async function load() {
  * 为什么不让浏览器自己抓：凑 20 天要发 40+ 个跨域 JSONP，既占满浏览器
  * 到东财的并发（本页板块榜还要用它），又容易撞限流。服务端抓一次全页共用。
  */
-const KL_CACHE = "kl_zt_v2";
+const KL_CACHE = "kl_zt_v3";
 // 前端缓存时长分两档：已收盘（历史日不会再变）可以久一点，盘中那根 20 秒就变，
 // 缓存久了会出现「卡片写 45、图上今日点写 32」。页面本身 40 秒整页刷新一次，
 // 所以盘中这一档设成 25 秒，保证图跟卡片基本同步。
@@ -543,10 +550,10 @@ function klCacheGet() {
   try {
     const o = JSON.parse(localStorage.getItem(KL_CACHE) || "null");
     if (!o || !o.ready || !o.series || !o.series.length || o.day !== todayStr()) return null;
-    // 加「首板」之前存下的缓存里没有 first 字段，直接拿来用会让首板线整条空着。
-    // 判一下字段在不在，不在就丢掉重拉（五个小时内只多一次请求）。
+    // 加「炸板」之前存下的缓存里没有 zb 字段，直接拿来用会让炸板线整条空着。
+    // 判一下字段在不在，不在就丢掉重拉（一天最多多几次请求）。
     const s0 = o.series[0];
-    if (s0 && !("first" in s0)) return null;
+    if (s0 && (!("first" in s0) || !("zb" in s0))) return null;
     const last = o.series[o.series.length - 1];
     const ttl = (last && last.live && !last.final) ? KL_MAX_AGE_LIVE : KL_MAX_AGE;
     if (Date.now() - (o.ts || 0) < ttl) return o;
@@ -588,7 +595,9 @@ function klOption(rows) {
   // 首板数＝涨停池里连板数(lbc) 为 1 的家数。老缓存没有这个字段，给 null 让线
   // 断开，绝不能兜成 0 —— 0 会画成「那天一只首板都没有」，跟事实正好相反。
   const FS = r => (r.first != null ? r.first : (r.fs != null ? r.fs : null));
-  const ztC = rows.map(ZT), dtC = rows.map(DT), fsC = rows.map(FS);
+  // 炸板数＝盘中摸过涨停、收盘没封住的家数。历史深度只有 ~14 个交易日，更早给 null。
+  const ZB = r => (r.zb != null ? r.zb : null);
+  const ztC = rows.map(ZT), dtC = rows.map(DT), fsC = rows.map(FS), zbC = rows.map(ZB);
   const lastIdx = rows.length - 1;
 
   // 折线取「每个交易日收盘时的家数」。家数本身就是一天一个定值 ——
@@ -598,7 +607,9 @@ function klOption(rows) {
   // 红线掉下来和绿线靠近/交叉＝退潮，这是最该减仓的时候。
   // 首板（橙）是涨停（红）的子集，永远在红线下方，要看的是两线的间距：
   // 间距宽＝新资金主导、赚钱效应在扩散；贴得死紧＝涨停全靠高位连板堆出来的。
-  const RED = "#e03b3b", GREEN = "#1aa251", ORANGE = "#f59e0b";
+  // 炸板（紫）是「想涨没涨上」的那批，跟红线此消彼长：紫线抬头＝承接不住，
+  // 通常比涨停家数掉下来还早一两天，是退潮的第一声警报。
+  const RED = "#e03b3b", GREEN = "#1aa251", ORANGE = "#f59e0b", PURPLE = "#8b5cf6";
 
   // 当日还没收盘（15:00 前）就画空心点：那个数字还在变，不能当收盘数看。
   // 空心靠「白填充 + 彩色描边」实现，不要用 symbol:"emptyCircle" ——
@@ -630,7 +641,7 @@ function klOption(rows) {
     legend: {
       top: 2, right: 6, itemWidth: 13, itemHeight: 8, itemGap: 16,
       textStyle: { color: "#5a6072", fontSize: 11.5 },
-      data: ["涨停家数", "首板数量", "跌停家数"]
+      data: ["涨停家数", "首板数量", "炸板数量", "跌停家数"]
     },
     tooltip: {
       trigger: "axis",
@@ -646,15 +657,22 @@ function klOption(rows) {
         if (!r) return "";
         const prev = i > 0 ? rows[i - 1] : null;
         const dz = prev ? ZT(r) - ZT(prev) : 0;
-        // 跌停可能为 null（上游历史不够），差值要先判空，否则会算出 NaN
+        // 跌停 / 炸板可能为 null（上游历史不够），差值要先判空，否则会算出 NaN
         const dd = (prev && DT(r) != null && DT(prev) != null) ? DT(r) - DT(prev) : null;
+        const dzb = (prev && ZB(r) != null && ZB(prev) != null) ? ZB(r) - ZB(prev) : null;
         const sgn = v => (v > 0 ? "+" : "") + v;
-        // 涨停增＝红（转强），跌停增＝绿（恶化），都按「情绪好坏」上色
+        // 涨停增＝红（转强），跌停/炸板增＝绿（恶化），都按「情绪好坏」上色
         const cz = dz > 0 ? RED : (dz < 0 ? GREEN : "#8a90a0");
         const cd = dd == null ? "#8a90a0" : (dd > 0 ? GREEN : (dd < 0 ? RED : "#8a90a0"));
+        const czb = dzb == null ? "#8a90a0" : (dzb > 0 ? GREEN : (dzb < 0 ? RED : "#8a90a0"));
         const ratio = DT(r) ? (ZT(r) / DT(r)).toFixed(1) : "∞";
+        // 封板率＝封住 / 摸过板的全部。用池子口径算，跟顶部卡片的「炸板率」
+        // 不是一路数据（那个是全市场行情逐只判定、还剔了 ST），会差 1~4 家。
+        const seal = (ZB(r) != null && (ZT(r) + ZB(r)) > 0)
+          ? Math.round(ZT(r) * 100 / (ZT(r) + ZB(r))) : null;
         const f = FS(r);
         const fShare = (f != null && ZT(r)) ? Math.round(f * 100 / ZT(r)) : null;
+        const NA = '<span style="color:#a0a6b4">— 上游仅保留近 ';
         const tag = r.live
           ? (r.final ? ' <span style="color:#2563eb">今日收盘</span>'
                      : ' <span style="color:#f59e0b">盘中·未收盘</span>')
@@ -667,8 +685,14 @@ function klOption(rows) {
                 + (fShare != null
                     ? ' <span style="color:#8a90a0">占涨停 ' + fShare + '%</span>' : "")
               : '')
+          + (ZB(r) == null
+              ? '<br><span style="color:' + PURPLE + '">●</span> 炸板 ' + NA + '14 个交易日</span>'
+              : '<br><span style="color:' + PURPLE + '">●</span> 炸板 <b>' + ZB(r) + '</b> 家'
+                + (dzb != null ? ' <span style="color:' + czb + '">' + sgn(dzb) + '</span>' : "")
+                + (seal != null
+                    ? ' <span style="color:#8a90a0">封板率 ' + seal + '%</span>' : ""))
           + (DT(r) == null
-              ? '<br><span style="color:' + GREEN + '">●</span> 跌停 <span style="color:#a0a6b4">— 上游仅保留近 15 个交易日</span>'
+              ? '<br><span style="color:' + GREEN + '">●</span> 跌停 ' + NA + '15 个交易日</span>'
               : '<br><span style="color:' + GREEN + '">●</span> 跌停 <b>' + DT(r) + '</b> 家'
                 + (dd != null ? ' <span style="color:' + cd + '">' + sgn(dd) + '</span>' : "")
                 + '<br><span style="color:#8a90a0">涨跌停比 ' + ratio + '</span>');
@@ -726,6 +750,16 @@ function klOption(rows) {
         z: 7
       },
       {
+        // 炸板跟涨停同量级、又常常贴着红线走，所以不填面积（两块面积叠一起会糊），
+        // 用 z 压到最上层，免得被红线盖住看不到。
+        name: "炸板数量", type: "line", xAxisIndex: 0, yAxisIndex: 0,
+        data: withLiveDot(zbC, PURPLE),
+        smooth: false, symbol: "circle", symbolSize: 4.5, showSymbol: true,
+        lineStyle: { width: 1.8, color: PURPLE },
+        itemStyle: { color: PURPLE },
+        z: 8
+      },
+      {
         name: "跌停家数", type: "line", xAxisIndex: 0, yAxisIndex: 0,
         data: withLiveDot(dtC, GREEN),
         smooth: false, symbol: "circle", symbolSize: 5, showSymbol: true,
@@ -778,8 +812,10 @@ function drawKline(payload) {
   const pill = document.getElementById("klpill");
   if (pill) pill.textContent = payload.days + " 个交易日";
 
-  // 数据没变就别 setOption —— 40 秒一轮刷新里绝大多数时候是白重绘
-  const key = payload.series.map(r => r.d + "|" + (r.zt != null ? r.zt : r.zc) + "|" + (r.dt != null ? r.dt : r.dc)).join(",");
+  // 数据没变就别 setOption —— 40 秒一轮刷新里绝大多数时候是白重绘。
+  // 加了炸板线之后 key 里必须带上 zb，漏了的话炸板数变了图不跟着变。
+  const key = payload.series.map(r => r.d + "|" + (r.zt != null ? r.zt : r.zc)
+    + "|" + (r.dt != null ? r.dt : r.dc) + "|" + (r.zb != null ? r.zb : "")).join(",");
   if (_klChart && _klKey === key) return;
 
   // 容器还没布局出来（见上面的说明），先等宽度

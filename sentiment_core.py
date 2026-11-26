@@ -478,17 +478,21 @@ _ZT_HIST_LOCK = threading.Lock()
 
 
 def fetch_pool_count(kind, ymd):
-    """查某一天的涨/跌停家数。kind='ZT' 或 'DT'。
+    """查某一天的涨/跌停/炸板家数。kind='ZT' 涨停 | 'DT' 跌停 | 'ZB' 炸板。
 
-    返回 {'tc': 家数, 'qdate': 日期, 'first': 首板数|None}；跌停池没有 'first'。
+    返回 {'tc': 家数, 'qdate': 日期, 'first': 首板数|None}；只有涨停池有 'first'。
 
     'first'＝连板数(lbc) 恰好为 1 的家数，从同一个响应的 pool 里数出来，
     **不额外发请求**。算不出来时给 None 而不是 0 —— 0 会被读成「当天没有首板」，
     跟真实情况正好相反。
     """
-    if kind not in ("ZT", "DT"):
+    if kind not in ("ZT", "DT", "ZB"):
         return None
-    sort = "fbt%3Aasc" if kind == "ZT" else "fund%3Aasc"
+    # ⚠️ 三个池的排序字段各认各的，传错了不会报错：
+    #    ZT 涨停池 fbt:asc（首次封板时间）
+    #    DT 跌停池 fund:asc —— 传 fbt 会 rc=0、tc 正常但 pool 空
+    #    ZB 炸板池 fbt:asc —— 反过来，传 fund:asc 同样 pool 空
+    sort = "fund%3Aasc" if kind == "DT" else "fbt%3Aasc"
     url = ("%sgetTopic%sPool?ut=%s&dpt=wz.ztzt&Pageindex=0&pagesize=300&sort=%s&date=%s"
            % (EX_BASE, kind, EX_UT, sort, ymd))
     # timeout 给 12 秒：本地 8 秒够，但 Render 出海再回来经常 6~9 秒，
@@ -523,6 +527,21 @@ def _zt_hist_dt(dstr):
     """东财跌停家数。失败给 None（= 没数据，线断开），**不能给 0**。"""
     r = fetch_pool_count("DT", dstr.replace("-", ""))
     return (r["tc"] if r else None)
+
+
+def _zt_hist_zb(dstr):
+    """东财炸板家数（盘中摸到涨停、收盘没封住）。
+
+    ⚠️ tc == 0 一律当「没有数据」返回 None。炸板池在历史深度外返回的是 rc=0、
+    tc=0、pool 空 —— 跟「那天真的一家没炸板」长得一模一样，没法区分。而真实
+    0 家炸板只在全天一字板、涨停又极少的日子才可能出现，十万分之一的概率；
+    错画成 0 会被读成「封板率 100%、情绪极强」，比断线误导得多。
+    跌停池不能这么处理：跌停 0 家是常态（11-05/11-10/11-11 都是真的 0）。
+    """
+    r = fetch_pool_count("ZB", dstr.replace("-", ""))
+    if not r or not r["tc"]:
+        return None
+    return r["tc"]
 
 
 def _ths_first_count(info):
@@ -573,23 +592,39 @@ def _zt_scan_em(dates, workers):
     return ok, bad
 
 
-def _dt_scan(dates, workers):
-    """扫跌停池，返回 {日期: 家数}；抓失败的日期直接不进字典（= 留 null）。"""
+def _count_scan(kind, dates, workers):
+    """扫某一类池（'DT' 跌停 / 'ZB' 炸板），返回 {日期: 家数}。
+
+    没数据 / 抓失败的日期**不进字典**，下游读到就是 None（线断开），不是 0。
+    """
+    fn = _zt_hist_dt if kind == "DT" else _zt_hist_zb
     ok = {}
     if not dates:
         return ok
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for d, v in zip(dates, ex.map(_zt_hist_dt, dates)):
+        for d, v in zip(dates, ex.map(fn, dates)):
             if v is not None:
                 ok[d] = int(v)
     return ok
 
 
-def _zt_hist_full(days):
-    """扫最近 days 个工作日，返回有数据的 [{d, zt, dt, first, src}]（升序）。
+def _scan_with_retry(kind, dates, ok0=None):
+    """先按主并发扫一遍，漏掉的再以低并发补一轮。"""
+    ok = dict(ok0 or {})
+    if dates:
+        ok.update(_count_scan(kind, dates, ZT_HIST_WORKERS))
+        lost = [d for d in dates if d not in ok]
+        if lost:
+            ok.update(_count_scan(kind, lost, ZT_HIST_RETRY_WORKERS))
+    return ok
 
-    三段式：东财涨停池（失败降并发补一轮）-> 同花顺补东财没覆盖到的日子
-    -> 跌停池只问东财认得的日期（深度外问了恒为 0，白送请求还会画错）。
+
+def _zt_hist_full(days):
+    """扫最近 days 个工作日，返回有数据的 [{d, zt, dt, zb, first, src}]（升序）。
+
+    流程：东财涨停池（失败降并发补一轮）-> 同花顺补东财没覆盖到的日子
+    -> 跌停池 / 炸板池只问东财认得的日期（深度外问了恒为 0，白送请求还会画错）。
+    两个辅助池的历史深度都比涨停池短：跌停 ~15 天、炸板 ~14 天。
     """
     dates = list(reversed(last_trading_dates(days)))   # 旧 -> 新
 
@@ -614,13 +649,11 @@ def _zt_hist_full(days):
         return []
     valid = sorted(got)
 
-    dt_dates = [d for d in valid if got[d][2] == "em"]
-    dt_map = _dt_scan(dt_dates, ZT_HIST_WORKERS)
-    lost = [d for d in dt_dates if d not in dt_map]
-    if lost:
-        dt_map.update(_dt_scan(lost, ZT_HIST_RETRY_WORKERS))
+    pool_dates = [d for d in valid if got[d][2] == "em"]
+    dt_map = _scan_with_retry("DT", pool_dates)
+    zb_map = _scan_with_retry("ZB", pool_dates)
 
-    return [{"d": d, "zt": got[d][0], "dt": dt_map.get(d),
+    return [{"d": d, "zt": got[d][0], "dt": dt_map.get(d), "zb": zb_map.get(d),
              "first": got[d][1], "src": got[d][2]} for d in valid]
 
 
@@ -635,15 +668,17 @@ def zt_hist_diag(days=18):
         t0 = time.time()
         zt = fetch_pool_count("ZT", d.replace("-", ""))
         dt = fetch_pool_count("DT", d.replace("-", ""))
+        zb = fetch_pool_count("ZB", d.replace("-", ""))
         rows.append({
             "d": d,
             "zt": (zt or {}).get("tc"),
             "first": (zt or {}).get("first"),
             "dt": (dt or {}).get("tc"),
+            "zb": (zb or {}).get("tc"),
             "ms": int((time.time() - t0) * 1000),
         })
     return {"days": len(rows), "rows": rows,
-            "hint": "zt/dt 为 null = 该日请求失败；tc=0 = 上游没有这天的数据"}
+            "hint": "zt/dt/zb 为 null = 该日请求失败；tc=0 = 上游没有这天的数据"}
 
 
 def _zt_hist_load():
@@ -692,12 +727,12 @@ def _build_zt_history_locked(days):
     today_str = datetime.now().strftime("%Y-%m-%d")
     cache = STATE.get("zt_hist")
 
-    # 跨天 / 从没抓过 / 历史缓存太旧 / 旧缓存里没有 first 字段（加首板线之前
+    # 跨天 / 从没抓过 / 历史缓存太旧 / 旧缓存里缺字段（加首板线、炸板线之前
     # 存的）/ 旧缓存只有 15 天（加同花顺回补之前存的，上限卡在 ZT_HIST_DAYS
     # 的老值）-> 全量重扫。漏掉这些判据的话，旧缓存会一直生效到跨天，
-    # 用户看到的就是「改了代码但还是 15 天」，排查起来极容易误判。
+    # 用户看到的就是「改了代码但新线是空的」，排查起来极容易误判。
     rows_ready = bool(cache and cache.get("days")
-                      and all("first" in r for r in cache["days"]))
+                      and all(("first" in r and "zb" in r) for r in cache["days"]))
     need_full = (not cache or not rows_ready
                  or cache.get("day") != today_str
                  or now - float(cache.get("full_ts") or 0) > ZT_FULL_TTL
@@ -722,6 +757,7 @@ def _build_zt_history_locked(days):
             rows = [r for r in cache["days"] if r["d"] != today_str]
             rows.append({"d": today_str, "zt": int(today_row[1]),
                          "dt": _zt_hist_dt(today_str),
+                         "zb": _zt_hist_zb(today_str),
                          "first": (int(today_row[2])
                                    if today_row[2] is not None else None),
                          "src": "em"})
@@ -735,7 +771,7 @@ def _build_zt_history_locked(days):
 
 
 def zt_kline_payload(limit=30):
-    """给前端的「每日收盘涨跌停家数 + 首板数」序列（同坐标系三条线）。
+    """给前端的「每日收盘涨跌停家数 + 首板数 + 炸板数」序列（同坐标系四条线）。
 
     东财涨停池/跌停池的 tc 字段本身就是「该交易日截至当时的家数」：查历史日期
     拿到的是那天收盘的定值，查今天拿到的是实时值。所以这个序列天然就是收盘口径，
@@ -745,6 +781,12 @@ def zt_kline_payload(limit=30):
     它和涨停家数是父子关系（首板 ⊆ 涨停），同轴画出来一眼能看出涨停的成色：
     涨停多但首板少＝资金在抱团高位、新资金不敢接；涨停少但全是首板＝冰点里
     有新资金试探。这是超短最该看的结构信号，单看总数看不出来。
+
+    zb（炸板数）来自东财炸板池：盘中摸到涨停、收盘没封住的家数。
+    `zt / (zt + zb)` 就是封板率，zb 抬头＝承接不住，是退潮最早的信号 ——
+    往往比涨停家数掉下来还早一两天。⚠️ 跟顶部卡片的「炸板率」不是同一路
+    数据（卡片是全市场行情按涨停价逐只判定、还剔了 ST），数值会差 1~4 家，
+    别拿两边的百分比互相验证。
 
     唯一需要区分的是「今天还没收盘」——那天数字会跟着盘中跳动，标 final=False，
     前端用空心点画出来，免得把盘中数当成收盘数。
@@ -758,12 +800,14 @@ def zt_kline_payload(limit=30):
     for r in rows:
         is_today = r["d"] == today_str
         dtv = r.get("dt")
+        zbv = r.get("zb")
         out.append({
             "d": r["d"],
             "zt": int(r["zt"]),
-            # 跌停只有东财一个源，历史深度外为 None —— 必须原样透出 null 让前端
-            # 断线。兜 0 会画成「那天一家跌停都没有」，跟事实正好相反。
+            # 跌停 / 炸板只有东财一个源，历史深度外为 None —— 必须原样透出 null
+            # 让前端断线。兜 0 会画成「那天一家跌停/炸板都没有」，跟事实正好相反。
             "dt": (int(dtv) if dtv is not None else None),
+            "zb": (int(zbv) if zbv is not None else None),
             "first": (int(r["first"]) if r.get("first") is not None else None),
             "live": is_today,                        # 兼容旧前端字段
             "final": (not is_today) or closed_now,   # 是否已是收盘定值
@@ -771,15 +815,17 @@ def zt_kline_payload(limit=30):
 
     tail = out[-limit:]
     dt_from = next((x["d"] for x in tail if x["dt"] is not None), "")
+    zb_from = next((x["d"] for x in tail if x["zb"] is not None), "")
     return {
         "ready": bool(tail),
         "days": len(tail),
         "today": today_str,
         "closed": closed_now,
         "dt_from": dt_from,       # 跌停家数最早可得的日期（更早的日子上游没有）
-        "source": ("东方财富 涨停池/跌停池（与看板卡片同口径；首板＝连板数 1 的家数）；"
-                   "东财只有近 15 个交易日，更早的涨停/首板由同花顺涨停池补齐，"
-                   "跌停无第二数据源，故仅近 15 日"),
+        "zb_from": zb_from,       # 炸板家数最早可得的日期（比跌停还短几天）
+        "source": ("东方财富 涨停池/跌停池/炸板池（与看板卡片同口径；"
+                   "首板＝连板数 1 的家数）；东财只有近 15 个交易日，更早的涨停/首板"
+                   "由同花顺涨停池补齐；跌停、炸板无第二数据源，故仅近 15／14 日"),
         "series": tail,
         "updated": now.strftime("%H:%M:%S"),
     }
